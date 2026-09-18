@@ -7,7 +7,9 @@ window.__ModuleLoader__.load({
     const PENDING_MARKER = "data-workbuddy-new-session-selector";
     const WORKBUDDY_PROVIDER_PATTERN = /(?:^|-)(?:work-?buddy|code-?buddy)(?:-|$)/;
     const React = require("react");
+    const ReactDOM = require("react-dom");
     const { createElement, useEffect, useState } = React;
+    const { createPortal } = ReactDOM;
 
     function isWorkBuddyProvider(value) {
       const normalized = String(value ?? "")
@@ -375,6 +377,85 @@ window.__ModuleLoader__.load({
         });
     }
 
+    // Shared, persistent credits cache keyed by account id. One entry per
+    // WorkBuddy token account, reused by every dock (any session or window) so
+    // a refresh, a new window, or a session switch reads the same value instead
+    // of re-polling. Backed by localStorage so it survives page reload; an
+    // in-memory map is the live copy for the current page.
+    const CREDIT_CACHE_TTL_MS = 30_000;
+    const CREDIT_CACHE_KEY = "dsh-llm-workbuddy:credits";
+    const creditCache = (() => {
+      const memory = new Map();
+      try {
+        const raw = typeof localStorage !== "undefined" ? localStorage.getItem(CREDIT_CACHE_KEY) : null;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object") {
+            for (const [id, entry] of Object.entries(parsed)) memory.set(id, entry);
+          }
+        }
+      } catch {
+        // Corrupt or unavailable storage keeps the in-memory map empty.
+      }
+      const persist = () => {
+        try {
+          if (typeof localStorage !== "undefined") {
+            localStorage.setItem(CREDIT_CACHE_KEY, JSON.stringify(Object.fromEntries(memory)));
+          }
+        } catch {
+          // Persistence is best-effort; the live map still serves the cache.
+        }
+      };
+      return {
+        get(accountId) {
+          return memory.get(accountId) ?? null;
+        },
+        set(accountId, credits, todayUsage, unlimited, at) {
+          memory.set(accountId, {
+            credits,
+            todayUsage,
+            unlimited: unlimited ?? false,
+            creditLoading: false,
+            creditError: null,
+            todayUsageError: null,
+            fetchedAt: at,
+          });
+          persist();
+        },
+        setError(accountId, message, at) {
+          const prev = memory.get(accountId);
+          memory.set(accountId, {
+            ...(prev ?? {}),
+            credits: prev?.credits ?? null,
+            todayUsage: prev?.todayUsage ?? null,
+            unlimited: prev?.unlimited ?? false,
+            creditLoading: false,
+            creditError: message,
+            todayUsageError: "查询 WorkBuddy 今日请求量失败",
+            fetchedAt: at,
+          });
+          persist();
+        },
+        isFresh(accountId, now) {
+          const entry = memory.get(accountId);
+          return Boolean(entry) && typeof entry.fetchedAt === "number" && now - entry.fetchedAt < CREDIT_CACHE_TTL_MS;
+        },
+      };
+    })();
+    // A single in-flight credits request per account so concurrent triggers
+    // (e.g. two docks or a session switch plus a click) share one API call.
+    const creditInflight = new Map();
+
+    // Cached credits reading shown on the pill at rest. The popup refetches
+    // the credits API when opened, so a closed pill never triggers a request.
+    function cachedCreditsText(state) {
+      if (state?.creditLoading) return "剩余积分：读取中…";
+      if (state?.unlimited) return "剩余积分：不限量";
+      if (typeof state?.credits === "number" && Number.isFinite(state.credits)) return `剩余积分：${formatCredits(state.credits)}`;
+      if (state?.creditError) return "剩余积分：暂不可用";
+      return "剩余积分：—";
+    }
+
     function WorkBuddyCreditsDock({ useProjection, sessionId }) {
       let selection;
       try {
@@ -386,68 +467,153 @@ window.__ModuleLoader__.load({
       const selected = isWorkBuddyProvider(provider);
       const modlens = isModLensWorkBuddyProvider(provider);
       const [state, setState] = useState(null);
+      const [open, setOpen] = useState(false);
+      const rootRef = React.useRef(null);
+      // Merge the shared credit cache entry for the active account into state so
+      // the pill/popup show the latest cached reading across sessions/windows.
+      const applyCreditCache = React.useCallback((accountId) => {
+        const entry = accountId ? creditCache.get(accountId) : null;
+        setState((prev) => ({
+          ...(prev ?? { mode: "token" }),
+          credits: entry?.credits ?? null,
+          unlimited: entry?.unlimited ?? false,
+          todayUsage: entry?.todayUsage ?? null,
+          creditLoading: entry?.creditLoading ?? false,
+          creditError: entry?.creditError ?? null,
+          todayUsageError: entry?.todayUsageError ?? null,
+        }));
+      }, []);
+
+      useEffect(() => {
+        if (!open) return;
+        const onPointerDown = (event) => {
+          const target = event.target;
+          // The popup is portaled to document.body, so it sits outside rootRef;
+          // ignore clicks inside the popup itself (or on the pill) entirely.
+          if (!(target instanceof Node)) return;
+          if (target.closest && target.closest(".dsh-workbuddy-credits-popup")) return;
+          if (rootRef.current && rootRef.current.contains(target)) return;
+          setOpen(false);
+        };
+        const onKeyDown = (event) => {
+          if (event.key === "Escape") setOpen(false);
+        };
+        document.addEventListener("pointerdown", onPointerDown, true);
+        document.addEventListener("keydown", onKeyDown);
+        return () => {
+          document.removeEventListener("pointerdown", onPointerDown, true);
+          document.removeEventListener("keydown", onKeyDown);
+        };
+      }, [open]);
 
       useEffect(() => {
         let disposed = false;
-        let requestId = 0;
-        const load = async () => {
-          const currentRequestId = ++requestId;
+        // Status load seeds the pill visibility. When a token account is active,
+        // surface the shared cache immediately, then refresh it if stale (so a
+        // session switch, page reload, or new window updates within 30s bounds).
+        // The credits API is never polled on a timer; only triggered below.
+        const refresh = async () => {
           if (!selected) {
             setState(null);
             return;
           }
-          setState({ mode: "token", creditLoading: true, credits: undefined, todayUsage: null, creditError: null, todayUsageError: null });
           let status;
           try {
             status = await authRequest("status", undefined, sessionId);
           } catch {
-            if (!disposed && currentRequestId === requestId) setState(null);
+            if (!disposed) setState(null);
             return;
           }
-          if (disposed || currentRequestId !== requestId) return;
+          if (disposed) return;
           if (status.mode !== "token" || !status.activeAccountId) {
             setState({ ...status, creditLoading: false });
             return;
           }
-          try {
-            const result = await authRequest("credits", { accountId: status.activeAccountId }, sessionId);
-            if (!disposed && currentRequestId === requestId) setState({ ...status, ...result, creditLoading: false });
-          } catch (error) {
-            if (!disposed && currentRequestId === requestId) {
-              const message = error instanceof Error ? error.message : "查询 WorkBuddy 积分失败";
-              setState({
-                ...status,
-                credits: null,
-                creditLoading: false,
-                creditError: message,
-                todayUsage: null,
-                todayUsageError: "查询 WorkBuddy 今日请求量失败",
-              });
-            }
-          }
+          setState({ ...status, creditLoading: false });
+          applyCreditCache(status.activeAccountId);
+          void loadCredits(status.activeAccountId, sessionId);
         };
-        load();
-        const onAuthState = () => load();
+        refresh();
+        const onAuthState = () => refresh();
         window.addEventListener(AUTH_STATE_EVENT, onAuthState);
-        const timer = window.setInterval(load, 60_000);
         return () => {
           disposed = true;
           window.removeEventListener(AUTH_STATE_EVENT, onAuthState);
-          window.clearInterval(timer);
         };
-      }, [provider, selected, sessionId]);
+      }, [provider, selected, sessionId, applyCreditCache]);
+
+      // Resolve fresh credits for an account from the shared persistent cache.
+      // Skips the API when the cached entry is younger than CREDIT_CACHE_TTL_MS;
+      // concurrent triggers share one in-flight request. On success/error the
+      // cache (and every dock via applyCreditCache) is updated.
+      const loadCredits = async (accountId, sid) => {
+        if (!accountId) return;
+        const now = Date.now();
+        if (creditCache.isFresh(accountId, now)) {
+          applyCreditCache(accountId);
+          return;
+        }
+        const existing = creditInflight.get(accountId);
+        if (existing) {
+          try {
+            await existing;
+          } catch {
+            // Error surfaces through the cache entry written by the owner.
+          }
+          applyCreditCache(accountId);
+          return;
+        }
+        const promise = (async () => {
+          try {
+            const result = await authRequest("credits", { accountId }, sid);
+            creditCache.set(accountId, result.credits, result.todayUsage, result.unlimited, Date.now());
+            applyCreditCache(accountId);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "查询 WorkBuddy 积分失败";
+            creditCache.setError(accountId, message, Date.now());
+            applyCreditCache(accountId);
+          } finally {
+            creditInflight.delete(accountId);
+          }
+        })();
+        creditInflight.set(accountId, promise);
+        try {
+          await promise;
+        } catch {
+          // Already written into the cache above.
+        }
+      };
+
+      const onToggle = () => {
+        const next = !open;
+        setOpen(next);
+        if (next && state?.activeAccountId) void loadCredits(state.activeAccountId, sessionId);
+      };
+
+      // Position the portaled popup above the pill when there is room, otherwise
+      // below it; clamped inside the viewport so a pill near the edge cannot
+      // push the panel off-screen. Measured after layout to size to real content.
+      const [popupPos, setPopupPos] = useState(null);
+      React.useLayoutEffect(() => {
+        if (!open || !rootRef.current) {
+          setPopupPos(null);
+          return;
+        }
+        const anchor = rootRef.current.getBoundingClientRect();
+        const panel = document.querySelector(".dsh-workbuddy-credits-popup");
+        const margin = 12;
+        const gap = 8;
+        const width = panel ? Math.min(panel.offsetWidth, window.innerWidth - margin * 2) : 300;
+        const height = panel ? panel.offsetHeight : 160;
+        let left = Math.max(margin, Math.min(anchor.left, window.innerWidth - width - margin));
+        let top = anchor.top - gap - height;
+        if (top < margin) top = anchor.bottom + gap;
+        if (top + height > window.innerHeight - margin) top = Math.max(margin, window.innerHeight - height - margin);
+        setPopupPos({ position: "fixed", left, top, visibility: "visible" });
+      }, [open, state]);
 
       const hasTokenAccount = state?.mode === "token" && Boolean(state.activeAccountId);
       if (!selected || !state || (!state.routingEnabled && state.mode !== "token") || (!state.routingEnabled && state.mode === "token" && !state.activeAccountId) || (!sessionId && !hasTokenAccount)) return null;
-      const creditsText = state.creditLoading
-        ? "剩余积分：读取中…"
-        : state.unlimited
-          ? "剩余积分：不限量"
-          : typeof state.credits === "number" && Number.isFinite(state.credits)
-            ? `剩余积分：${formatCredits(state.credits)}`
-            : state.creditError
-              ? "剩余积分：暂不可用"
-              : "剩余积分：—";
       const today = state.todayUsage;
       const usageText = today?.synced === true
         ? `今日请求：${Number.isFinite(Number(today.count)) ? Number(today.count) : 0} 次 · 用量 ${formatCredits(today.used)} 积分`
@@ -543,31 +709,29 @@ window.__ModuleLoader__.load({
         state.sessionBinding ? createElement("button", { type: "button", onClick: onUnbind, title: "解除当前绑定，下次发送时重新绑定默认凭证", style: actionStyle }, "解除绑定") : null,
         createElement("span", { "aria-hidden": true, style: { opacity: 0.55, padding: "0 2px" } }, "·"),
       ) : null;
+      // Pill + popup: mirror the native session-stats pills beside it. The pill
+      // shows the cached credits reading; the popup (opened on click) refetches
+      // the credits API and lists usage. While closed, only cached info shows.
+      const creditsLabel = cachedCreditsText(state);
+      const popupTitle = [activeAccount ? `当前账号：${accountText(activeAccount)}` : "", state.creditError, state.todayUsageError].filter(Boolean).join("；") || "WorkBuddy 用量";
       return createElement(
         "div",
         {
           className: "dsh-workbuddy-credits",
           "data-workbuddy-credits": true,
           "data-workbuddy-session-aware": state.routingEnabled ? true : undefined,
-          role: "status",
-          "aria-live": "polite",
-          title: [activeAccount ? `当前账号：${accountText(activeAccount)}` : "", state.creditError, state.todayUsageError].filter(Boolean).join("；") || undefined,
           style: {
             boxSizing: "border-box",
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            gap: "12px",
             minWidth: 0,
-            width: "100%",
             maxWidth: "100%",
             minHeight: "20px",
             padding: "0",
-            display: "inline-flex",
+            flex: "0 0 auto",
             flexWrap: "wrap",
-            gap: "2px 8px",
-            flex: "0 1 auto",
-            justifyContent: "flex-end",
-            alignItems: "center",
-            color: "var(--dsw-text-tertiary, #98a2b3)",
-            fontSize: "12px",
-            lineHeight: "18px",
             fontVariantNumeric: "tabular-nums",
             whiteSpace: "normal",
             overflow: "visible",
@@ -575,10 +739,90 @@ window.__ModuleLoader__.load({
           },
         },
         sessionControls,
-        state.mode === "token" ? createElement("span", null, creditsText) : null,
-        state.mode === "token" ? createElement("span", { "aria-hidden": true, style: { opacity: 0.55, padding: "0 4px" } }, "·") : null,
-        state.mode === "token" ? createElement("span", null, usageText) : createElement("span", null, "当前会话 API Key"),
-        modlensHint,
+        state.mode === "token" ? createElement(
+          "span",
+          { className: "dsh-workbuddy-credits-pill-anchor", ref: rootRef },
+          createElement(
+            "button",
+            {
+              type: "button",
+              className: "dsh-workbuddy-credits-pill",
+              "aria-haspopup": "dialog",
+              "aria-expanded": open,
+              "aria-label": creditsLabel,
+              title: popupTitle,
+              onClick: onToggle,
+              style: { cursor: "pointer" },
+            },
+            createElement("span", { className: "dsh-workbuddy-credits-pill-label", style: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, creditsLabel),
+          ),
+          open ? createPortal(
+            createElement(
+              "div",
+              {
+                className: "dsh-workbuddy-credits-popup",
+                role: "dialog",
+                "aria-label": popupTitle,
+                onClick: (event) => { event.stopPropagation(); },
+                style: {
+                  ...(popupPos ?? { position: "fixed", left: 0, top: 0, visibility: "hidden" }),
+                  zIndex: 1100,
+                  boxSizing: "border-box",
+                  width: "max-content",
+                  minWidth: "min(300px, calc(100vw - 24px))",
+                  maxWidth: "min(440px, calc(100vw - 24px))",
+                  maxHeight: "calc(100vh - 24px)",
+                  overflowY: "auto",
+                  padding: "16px",
+                  border: "0",
+                  borderRadius: "12px",
+                  background: "var(--dsw-specific-menu, #ffffff)",
+                  boxShadow: "var(--dsw-elevation-prominent, 0 12px 32px rgba(16, 24, 40, 0.18))",
+                  color: "var(--dsw-alias-label-secondary, #475467)",
+                  fontSize: "12px",
+                  lineHeight: "18px",
+                  cursor: "default",
+                },
+              },
+              createElement(
+                "div",
+                { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "16px", marginBottom: "8px", color: "var(--dsw-alias-label-primary, #101828)", fontWeight: 500 } },
+                createElement("span", { style: { minWidth: 0, overflowWrap: "anywhere" } }, popupTitle),
+                createElement(
+                  "span",
+                  { style: { display: "inline-flex", flex: "none", gap: "4px" } },
+                  createElement("button", {
+                    type: "button",
+                    "aria-label": "关闭",
+                    onClick: () => setOpen(false),
+                    style: {
+                      flex: "none",
+                      border: "none",
+                      background: "transparent",
+                      color: "inherit",
+                      font: "inherit",
+                      fontSize: "14px",
+                      lineHeight: "18px",
+                      cursor: "pointer",
+                      padding: "0 2px",
+                    },
+                  }, "✕"),
+                ),
+              ),
+              createElement("div", { style: { marginBottom: "10px", borderTop: "0.5px solid var(--dsw-alias-border-l2, #eaecf0)" } }),
+              createElement(
+                "dl",
+                { style: { display: "grid", gridTemplateColumns: "minmax(76px, auto) minmax(0, 1fr)", gap: "6px 16px", margin: 0, color: "var(--dsw-alias-label-tertiary, #98a2b3)" } },
+                createElement("dt", { style: { minWidth: 0, margin: 0 } }, "剩余积分"),
+                createElement("dd", { style: { minWidth: 0, margin: 0, color: "var(--dsw-alias-label-secondary, #475467)", fontVariantNumeric: "tabular-nums", textAlign: "right" } }, creditsLabel.replace("剩余积分：", "")),
+                createElement("dt", { style: { minWidth: 0, margin: 0 } }, "今日用量"),
+                createElement("dd", { style: { minWidth: 0, margin: 0, color: "var(--dsw-alias-label-secondary, #475467)", fontVariantNumeric: "tabular-nums", textAlign: "right" } }, usageText.replace("今日请求：", "")),
+              ),
+              modlensHint,
+            ),
+            document.body,
+          ) : null,
+        ) : createElement("span", null, "当前会话 API Key"),
       );
     }
 
@@ -593,24 +837,22 @@ window.__ModuleLoader__.load({
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
-  display: grid !important;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  display: flex !important;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: center;
   gap: 12px;
   padding: 0 4px 4px;
   overflow: hidden;
 }
 [data-slot="conversation.composer.dock"] > [data-composer-stats] {
-  grid-column: 2;
   width: auto !important;
   max-width: 100%;
   min-width: 0;
   margin: 0 !important;
 }
 [data-slot="conversation.composer.dock"] > [data-workbuddy-credits] {
-  grid-column: 3;
-  justify-self: end;
-  width: 100% !important;
+  width: auto !important;
   max-width: 100%;
   min-width: 0;
   margin: 0 !important;
@@ -622,17 +864,28 @@ window.__ModuleLoader__.load({
   flex-basis: 100%;
   width: 100%;
 }
-@media (max-width: 760px) {
-  [data-slot="conversation.composer.dock"]:has(> [data-composer-stats]),
-  [data-slot="conversation.composer.dock"]:has(> [data-workbuddy-credits]) {
-    display: flex !important;
-    flex-wrap: wrap;
-    justify-content: center;
-  }
-  [data-slot="conversation.composer.dock"] > [data-composer-stats],
-  [data-slot="conversation.composer.dock"] > [data-workbuddy-credits] {
-    flex: 0 1 auto;
-  }
+/* WorkBuddy credits pill mirrors the native session-stats pills: 13/20 tertiary
+   text tier, rounded pill, and the same hover affordance as button.pill. */
+.dsh-workbuddy-credits-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 1px 8px;
+  border: none;
+  border-radius: 24px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.dsh-workbuddy-credits-pill:hover,
+.dsh-workbuddy-credits-pill[aria-expanded='true'] {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
 }
 `;
       document.head.appendChild(style);
