@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 *.log
+
+# 本仓库以 package-lock.json 为唯一锁文件（npm）。pnpm-lock.yaml 是本地
+# 用 pnpm 试装时产生的，两者并存会给出互相矛盾的依赖解析结果。
+pnpm-lock.yaml
