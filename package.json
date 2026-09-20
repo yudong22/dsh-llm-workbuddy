@@ -1,7 +1,7 @@
 {
   "name": "@axiaohungry/dsh-llm-workbuddy",
   "version": "1.3.20",
-  "description": "通过 WorkBuddy API Key 或 WorkBuddy 登录令牌为 DeepSeek Harness 接入 WorkBuddy 模型",
+  "description": "通过 WorkBuddy API Key 为 DeepSeek Harness 接入 WorkBuddy 模型",
   "author": "Axiaohungry",
   "keywords": [
     "deepseek-harness",
@@ -30,7 +30,6 @@
   },
   "files": [
     "index.js",
-    "workbuddy-auth.js",
     "workbuddy-credits.js",
     "workbuddy-web.js",
     "client.js",
@@ -41,7 +40,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check workbuddy-auth.js && node --check workbuddy-credits.js && node --check workbuddy-web.js && node --check client.js && node --check cli.js && node --test test.js && node cli.js --self-test"
+    "check": "node --check index.js && node --check workbuddy-credits.js && node --check workbuddy-web.js && node --check client.js && node --check cli.js && node --test test.js && node cli.js --self-test"
   },
   "dsh": {
     "engines": {
@@ -59,7 +58,6 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.2",
     "pnpm": "11.19.0",
     "yaml": "2.9.0"
   },
@@ -69,6 +67,7 @@
     "@deepseek-ai/dsh-llm": ">=0.1.2-alpha.2 <0.2.0",
     "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.2-alpha.2 <0.2.0",
     "@deepseek-ai/dsh-settings": ">=0.1.2-alpha.2 <0.2.0",
+    "@earendil-works/pi-ai": ">=0.84.2",
     "react": "^18.2.0"
   },
   "engines": {

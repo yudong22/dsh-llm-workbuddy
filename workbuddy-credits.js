@@ -1,6 +1,18 @@
-const DEFAULT_BILLING_HOST = "https://www.codebuddy.cn";
-const BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
-const ENTERPRISE_EDITIONS = new Set(["ultimate", "exclusive"]);
+/**
+ * WorkBuddy 剩余积分查询。
+ *
+ * 只使用 API Key 认证：`/v2/billing/meter/get-user-resource` 接受与模型请求
+ * 相同的 WorkBuddy API Key，因此积分胶囊和模型调用共用同一份凭据。
+ *
+ * 今日请求次数与今日积分用量来自 `/billing/meter/get-user-request-usage`，
+ * 该接口只接受登录令牌（API Key 会得到网关 401），因此本模块不再查询它。
+ */
+
+const BILLING_HOST = "https://www.codebuddy.cn";
+const REQUEST_TIMEOUT_MS = 12_000;
+const PRODUCT_CODE = "p_tcaca";
+
+/** 个人额度按周期计费的剩余量字段，优先级从高到低。 */
 const REMAINING_FIELDS = [
   "SlicePeriodCapacityRemainPrecise",
   "SlicePeriodCapacityRemain",
@@ -43,77 +55,14 @@ const EXPIRY_FIELDS = [
   "ExpireAt",
 ];
 const LABEL_FIELDS = ["PackageName", "PackageTypeName", "AccountName", "ProductName", "Name", "RuleName", "Description"];
-const MAX_USAGE_PAGES = 100;
-const PAGE_SIZE = 100;
 
-function normalizeHost(value) {
-  const fallback = new URL(DEFAULT_BILLING_HOST);
-  if (typeof value !== "string" || !value.trim()) return fallback.origin;
-  try {
-    const candidate = new URL(value.includes("://") ? value : `https://${value}`);
-    if (candidate.protocol !== "https:") return fallback.origin;
-    const host = candidate.hostname.toLowerCase();
-    if (!["codebuddy.cn", "www.codebuddy.cn", "workbuddy.cn", "www.workbuddy.cn"].includes(host)) return fallback.origin;
-    return candidate.origin;
-  } catch {
-    return fallback.origin;
-  }
-}
-
-function billingHost(session) {
-  return normalizeHost(session?.auth?.domain);
-}
-
-function authToken(session) {
-  const token = typeof session?.auth?.accessToken === "string" ? session.auth.accessToken.trim() : "";
-  if (!token) throw new Error("WorkBuddy 登录令牌为空");
-  return token;
-}
-
-function billingHeaders(session, host, enterpriseId) {
-  const headers = {
-    accept: "application/json, text/plain, */*",
-    "content-type": "application/json",
-    "x-client-platform": "web",
-    origin: host,
-    referer: `${host}/profile/plans-usage`,
-    authorization: `Bearer ${authToken(session)}`,
-    "user-agent": BROWSER_USER_AGENT,
-  };
-  const domain = typeof session?.auth?.domain === "string" ? session.auth.domain.trim() : "";
-  if (domain) headers["x-domain"] = domain;
-  const userId = typeof session?.account?.userId === "string" ? session.account.userId.trim() : "";
-  if (userId) headers["x-user-id"] = userId;
-  if (enterpriseId) {
-    headers["x-enterprise-id"] = String(enterpriseId);
-    headers["x-tenant-id"] = String(enterpriseId);
-  }
-  return headers;
-}
-
-function timeoutSignal(timeoutMs, externalSignal) {
-  if (externalSignal) return externalSignal;
-  if (typeof AbortSignal?.timeout === "function") return AbortSignal.timeout(timeoutMs);
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(), timeoutMs).unref?.();
-  return controller.signal;
-}
-
-async function readJson(response, action) {
-  const raw = await response.text();
-  if (!raw.trim()) throw new Error(`${action}返回空响应（HTTP ${response.status}）`);
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch (error) {
-    throw new Error(`${action}返回了无法解析的数据`, { cause: error });
-  }
-  if (!response.ok) throw new Error(`${action} HTTP ${response.status}: ${raw.slice(0, 160)}`);
-  if (payload?.code !== undefined && payload.code !== null && payload.code !== 0) {
-    throw new Error(`${action}失败（${payload.msg ?? payload.message ?? `code=${payload.code}`}）`);
-  }
-  return payload;
-}
+/** 汇总剩余积分时使用的字段，与逐条明细的字段优先级不同。 */
+const SUMMARY_REMAINING_FIELDS = [
+  "CycleCapacityRemainPrecise",
+  "CycleCapacityRemain",
+  "CapacityRemainPrecise",
+  "CapacityRemain",
+];
 
 function firstNumber(value, fields) {
   for (const field of fields) {
@@ -152,6 +101,7 @@ function firstText(value, fields) {
   return "";
 }
 
+/** 响应外层结构在 WorkBuddy 各版本间有差异，这里列出全部已知包装。 */
 function extractAccounts(payload) {
   const candidates = [
     payload?.data?.Response?.Data?.Accounts,
@@ -202,6 +152,7 @@ function sortSegments(segments) {
     });
 }
 
+/** 同一到期时间的多个资源包合并成一条，避免弹层里重复出现同名条目。 */
 function mergeSegments(segments) {
   const merged = new Map();
   for (const segment of Array.isArray(segments) ? segments : []) {
@@ -234,149 +185,58 @@ function buildCreditResourceBody(now = new Date()) {
   return {
     PageNumber: 1,
     PageSize: 100,
-    ProductCode: "p_tcaca",
+    ProductCode: PRODUCT_CODE,
     Status: [0, 3],
     PackageEndTimeRangeBegin: format(now),
     PackageEndTimeRangeEnd: format(end),
   };
 }
 
-async function postJson(url, session, body, action, options = {}) {
+function billingHeaders(apiKey) {
+  // 与模型请求一致：同时发送 Authorization 与 X-API-Key，兼容服务端策略变化。
+  return {
+    accept: "application/json, text/plain, */*",
+    "content-type": "application/json",
+    "x-client-platform": "web",
+    authorization: `Bearer ${apiKey}`,
+    "x-api-key": apiKey,
+  };
+}
+
+function timeoutSignal(timeoutMs, externalSignal) {
+  if (externalSignal) return externalSignal;
+  if (typeof AbortSignal?.timeout === "function") return AbortSignal.timeout(timeoutMs);
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), timeoutMs).unref?.();
+  return controller.signal;
+}
+
+async function readJson(response, action) {
+  const raw = await response.text();
+  // HTTP 状态先于正文解析：上游失败时常返回 HTML 或空正文，先解析会把
+  // 真正的原因（401/403/5xx）替换成“无法解析的数据”。
+  if (!response.ok) throw new Error(`${action} HTTP ${response.status}: ${raw.slice(0, 160)}`);
+  if (!raw.trim()) throw new Error(`${action}返回空响应（HTTP ${response.status}）`);
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`${action}返回了无法解析的数据`, { cause: error });
+  }
+  if (payload?.code !== undefined && payload.code !== null && payload.code !== 0) {
+    throw new Error(`${action}失败（${payload.msg ?? payload.message ?? `code=${payload.code}`}）`);
+  }
+  return payload;
+}
+
+async function postJson(url, apiKey, body, action, options = {}) {
   const response = await (options.fetchImpl || globalThis.fetch)(url, {
     method: "POST",
-    headers: billingHeaders(session, options.host, options.enterpriseId),
+    headers: billingHeaders(apiKey),
     body: JSON.stringify(body),
-    signal: timeoutSignal(options.timeoutMs ?? 12_000, options.signal),
+    signal: timeoutSignal(options.timeoutMs ?? REQUEST_TIMEOUT_MS, options.signal),
   });
   return readJson(response, action);
-}
-
-function enterpriseUsage(payload) {
-  const candidates = [payload?.data, payload?.data?.data, payload?.data?.Response?.Data, payload];
-  const data = candidates.find((value) => value && typeof value === "object" && ("limitNum" in value || "LimitNum" in value));
-  if (!data) return null;
-  const limitNum = Number(data.limitNum ?? data.LimitNum);
-  if (!Number.isFinite(limitNum)) return null;
-  const reset = firstTimestamp(data, ["cycleResetTime", "CycleResetTime", "CycleResetTimeMs"]);
-  if (limitNum === -1) return { unlimited: true, credits: null, total: null, count: 0, segments: [], cycleResetTime: reset };
-  const credit = Number(data.credit ?? data.Credit);
-  const used = Number.isFinite(credit) ? credit : 0;
-  const credits = Math.max(0, limitNum - used);
-  return {
-    unlimited: false,
-    credits: Number(credits.toFixed(2)),
-    total: Number(limitNum.toFixed(2)),
-    count: 1,
-    segments: sortSegments([{ remaining: credits, total: limitNum, expiresAt: reset, source: "企业配额" }]),
-    cycleResetTime: reset,
-  };
-}
-
-async function queryPersonalCredits(session, host, options = {}) {
-  const payload = await postJson(`${host}/v2/billing/meter/get-user-resource`, session, buildCreditResourceBody(), "WorkBuddy 积分接口", { ...options, host });
-  const accounts = extractAccounts(payload);
-  let credits = 0;
-  for (const account of accounts) {
-    const remaining = firstNumber(account, [
-      "CycleCapacityRemainPrecise",
-      "CycleCapacityRemain",
-      "CapacityRemainPrecise",
-      "CapacityRemain",
-    ]);
-    if (remaining !== null) credits += remaining;
-  }
-  return {
-    credits: Number(credits.toFixed(2)),
-    count: accounts.length,
-    totalDosage: payload?.data?.Response?.Data?.TotalDosage ?? payload?.data?.data?.Response?.Data?.TotalDosage ?? null,
-    segments: mergeSegments(extractCreditSegments(accounts)),
-    unlimited: false,
-    cycleResetTime: null,
-  };
-}
-
-async function resolveEnterpriseId(session, host, options = {}) {
-  const uid = session?.account?.userId;
-  if (!uid) return "";
-  const response = await (options.fetchImpl || globalThis.fetch)(`${host}/console/accounts`, {
-    method: "GET",
-    headers: billingHeaders(session, host),
-    signal: timeoutSignal(8_000, options.signal),
-  });
-  const payload = await readJson(response, "WorkBuddy 企业账号接口");
-  const accounts = payload?.data?.accounts;
-  const first = Array.isArray(accounts) ? accounts[0] : undefined;
-  return typeof first?.enterpriseId === "string" ? first.enterpriseId.trim() : "";
-}
-
-async function queryEnterpriseCredits(session, host, enterpriseId, options = {}) {
-  const payload = await postJson(`${host}/v2/billing/meter/get-enterprise-user-usage`, session, {}, "WorkBuddy 企业积分接口", {
-    ...options,
-    host,
-    enterpriseId,
-  });
-  const parsed = enterpriseUsage(payload);
-  if (!parsed) throw new Error("WorkBuddy 企业积分接口返回数据无法解析");
-  return parsed;
-}
-
-function pad2(value) {
-  return String(value).padStart(2, "0");
-}
-
-function formatLocalDateTime(date) {
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
-}
-
-function localDateString(date) {
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
-}
-
-function parseUsageTime(value) {
-  return parseTimestamp(value);
-}
-
-function usageRows(payload) {
-  const data = payload?.data;
-  const rows = data && Array.isArray(data.data) ? data.data : data && Array.isArray(data.rows) ? data.rows : [];
-  const total = Number(data?.total);
-  return { rows, total: Number.isSafeInteger(total) && total >= 0 ? total : rows.length };
-}
-
-async function queryTodayUsage(session, host, options = {}) {
-  const now = new Date();
-  const start = new Date(now.getTime());
-  start.setHours(0, 0, 0, 0);
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
-  const records = [];
-  let expectedTotal = null;
-  let fetched = 0;
-  for (let pageNum = 1; pageNum <= MAX_USAGE_PAGES; pageNum += 1) {
-    const payload = await postJson(`${host}/billing/meter/get-user-request-usage`, session, {
-      startTime: formatLocalDateTime(start),
-      endTime: formatLocalDateTime(now),
-      pageNum,
-      pageSize: PAGE_SIZE,
-    }, "WorkBuddy 今日请求量接口", { ...options, host, fetchImpl, timeoutMs: options.usageTimeoutMs ?? 8_000 });
-    const page = usageRows(payload);
-    if (expectedTotal === null) expectedTotal = page.total;
-    if (!page.rows.length) break;
-    for (const row of page.rows) {
-      const requestTime = parseUsageTime(row?.requestTime ?? row?.RequestTime ?? row?.createdAt);
-      const credit = Number(row?.credit ?? row?.Credit ?? 0);
-      if (requestTime === null || !Number.isFinite(credit) || credit < 0) continue;
-      records.push({ requestTime, credit });
-    }
-    fetched += page.rows.length;
-    if (fetched >= expectedTotal || page.rows.length < PAGE_SIZE) break;
-  }
-  const used = records.reduce((sum, record) => sum + record.credit, 0);
-  return {
-    date: localDateString(now),
-    used: Number(used.toFixed(2)),
-    count: records.length,
-    synced: true,
-  };
 }
 
 async function retry(task, attempts = 2) {
@@ -392,50 +252,55 @@ async function retry(task, attempts = 2) {
   throw lastError;
 }
 
-export async function fetchWorkBuddyCredits(session, options = {}) {
-  const host = billingHost(session);
-  const account = session?.account && typeof session.account === "object" ? session.account : {};
-  let creditResult;
-  let creditError = null;
+/**
+ * 查询当前 API Key 的剩余积分。
+ *
+ * 失败不抛出：积分属于附加信息，弹层显示“暂不可用”即可，不能影响模型调用。
+ * @param apiKey - WorkBuddy API Key。
+ * @param options - 注入 fetch 实现、超时与取消信号（测试与调用方使用）。
+ * @returns 剩余积分、资源包明细与失败信息。
+ */
+export async function fetchWorkBuddyCredits(apiKey, options = {}) {
   try {
-    const enterpriseId = typeof account.enterpriseId === "string" ? account.enterpriseId.trim() : "";
-    const enterpriseEdition = typeof account.type === "string" && ENTERPRISE_EDITIONS.has(account.type.toLowerCase());
-    if (enterpriseId || enterpriseEdition) {
-      const resolvedId = enterpriseId || await retry(() => resolveEnterpriseId(session, host, options));
-      if (!resolvedId) throw new Error("企业账号缺少 enterpriseId");
-      creditResult = await retry(() => queryEnterpriseCredits(session, host, resolvedId, options));
-    } else {
-      creditResult = await retry(() => queryPersonalCredits(session, host, options));
+    const payload = await retry(() => postJson(
+      `${BILLING_HOST}/v2/billing/meter/get-user-resource`,
+      apiKey,
+      buildCreditResourceBody(),
+      "WorkBuddy 积分接口",
+      options,
+    ));
+    const accounts = extractAccounts(payload);
+    let credits = 0;
+    for (const account of accounts) {
+      const remaining = firstNumber(account, SUMMARY_REMAINING_FIELDS);
+      if (remaining !== null) credits += remaining;
     }
+    return {
+      credits: Number(credits.toFixed(2)),
+      totalDosage: payload?.data?.Response?.Data?.TotalDosage ?? payload?.data?.data?.Response?.Data?.TotalDosage ?? null,
+      segments: mergeSegments(extractCreditSegments(accounts)),
+      count: accounts.length,
+      creditError: null,
+    };
   } catch (error) {
-    creditError = error instanceof Error ? error.message : String(error);
-    creditResult = { credits: null, count: 0, totalDosage: null, segments: [], unlimited: false, cycleResetTime: null };
+    return {
+      credits: null,
+      totalDosage: null,
+      segments: [],
+      count: 0,
+      creditError: error instanceof Error ? error.message : String(error),
+    };
   }
-
-  let todayUsage;
-  let todayUsageError = null;
-  try {
-    todayUsage = await retry(() => queryTodayUsage(session, host, options));
-  } catch (error) {
-    todayUsageError = error instanceof Error ? error.message : String(error);
-  }
-  return {
-    ...creditResult,
-    creditError,
-    todayUsage: todayUsage ?? null,
-    todayUsageError,
-  };
 }
 
 export const __testing = Object.freeze({
-  billingHost,
+  billingHeaders,
   buildCreditResourceBody,
-  enterpriseUsage,
   extractAccounts,
   extractCreditSegments,
-  formatLocalDateTime,
+  firstNumber,
+  firstTimestamp,
   mergeSegments,
-  normalizeHost,
-  queryTodayUsage,
+  parseTimestamp,
   sortSegments,
 });

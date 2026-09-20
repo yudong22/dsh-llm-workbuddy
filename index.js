@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { launchEnvironmentOf } from "@deepseek-ai/dsh-launch-environment";
 import { LlmError, assertUsableApiKey, resolveRetryPolicy } from "@deepseek-ai/dsh-llm";
@@ -9,27 +8,7 @@ import * as openAICompletionsApi from "@earendil-works/pi-ai/api/openai-completi
 import * as openAIResponsesApi from "@earendil-works/pi-ai/api/openai-responses";
 import * as anthropicMessagesApi from "@earendil-works/pi-ai/api/anthropic-messages";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import {
-  WORKBUDDY_SESSION_REF,
-  WORKBUDDY_SESSIONS_REF,
-  WORKBUDDY_SESSION_ROUTING_REF,
-  LEGACY_SESSION_REF,
-  LEGACY_SESSIONS_REF,
-  activeWorkBuddySession,
-  createWorkBuddySessionStore,
-  createWorkBuddySessionRoutingState,
-  parseWorkBuddySession,
-  parseWorkBuddySessions,
-  parseWorkBuddySessionRouting,
-  refreshWorkBuddySession,
-  serializeWorkBuddySession,
-  serializeWorkBuddySessionRouting,
-  serializeWorkBuddySessions,
-  sessionCacheDeadline,
-  sessionNeedsRefresh,
-  upsertWorkBuddySession,
-} from "./workbuddy-auth.js";
-import { installWorkBuddyWeb } from "./workbuddy-web.js";
+import { installWorkBuddyCredits } from "./workbuddy-web.js";
 
 export { Config };
 
@@ -38,12 +17,8 @@ export const inject = ["llm"];
 
 const NS = typeof dshSettings.settingsNamespace === "function" ? dshSettings.settingsNamespace("llm-pi-ai") : "llm-pi-ai";
 const PROVIDER = "workbuddy-cn";
-const LEGACY_PROVIDER = "codebuddy-cn";
-const WORKBUDDY_PROVIDERS = new Set([PROVIDER, LEGACY_PROVIDER]);
-const WORKBUDDY_PROVIDER_PATTERN = /(?:^|-)(?:work-?buddy|code-?buddy)(?:-|$)/;
 const DISPLAY_NAME = "WorkBuddy 中国区";
 const API_KEY_ENV = "WORKBUDDY_API_KEY";
-const LEGACY_API_KEY_ENV = "CODEBUDDY_API_KEY";
 const BASE_URL = "https://copilot.tencent.com/v2";
 const CONFIG_URL = "https://copilot.tencent.com/v3/config";
 const USER_AGENT = "CLI/unknown CodeBuddy/2.137.1";
@@ -58,6 +33,56 @@ const COMPAT = {
   maxTokensField: "max_tokens",
   thinkingFormat: "openai",
 };
+
+/**
+ * 本插件禁用宿主 `llm-pi-ai` 行后接管它原有的全部职责，因此除了
+ * WorkBuddy 自身，还要继续代理两类非 WorkBuddy 路由：
+ *
+ * 1. pi-ai 内置目录里带 API Key 的 provider（直接复用内置模型元数据）；
+ * 2. settings.yaml 里手写的通用 provider（`api` + `baseURL` + `models`）。
+ *
+ * 少了这一层，用户的其它 pi-ai provider 会随宿主行一起消失。
+ */
+const GENERIC_APIS = Object.freeze({
+  "openai-completions": openAICompletionsApi,
+  "openai-responses": openAIResponsesApi,
+  "anthropic-messages": anthropicMessagesApi,
+});
+const GENERIC_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * 注册进 settings base 层的 WorkBuddy 默认 profile。
+ *
+ * 配置界面把这一层显示为“提供方默认”：用户不必手填 API 地址与协议，添加
+ * provider 时地址、协议和兼容开关已经就位，只需粘贴 API Key。
+ */
+const WORKBUDDY_DEFAULT_PROFILE = {
+  displayName: DISPLAY_NAME,
+  api: "openai-completions",
+  baseURL: BASE_URL,
+  apiKeyEnv: API_KEY_ENV,
+  compat: { ...COMPAT },
+};
+
+/**
+ * 组合条目 → settings base 值。
+ *
+ * Cordis 在没有显式配置时传入的是 `{}` 而不是 undefined，所以不能用 `??`
+ * 兜底：必须始终把 WorkBuddy 默认 profile 合并进 base 层，否则模型设置页的
+ * “提供方默认”为空，用户仍要手填 API 地址。
+ * @param config - 组合条目里的插件配置。
+ * @returns 含 WorkBuddy 默认 profile 的 settings 条目。
+ */
+function settingsEntry(config) {
+  const providers = config?.providers ?? {};
+  return {
+    ...config,
+    providers: {
+      ...providers,
+      [PROVIDER]: { ...WORKBUDDY_DEFAULT_PROFILE, ...providers[PROVIDER] },
+    },
+  };
+}
 
 function workBuddyRequestOptions(options) {
   return {
@@ -151,6 +176,7 @@ function text(...values) {
   return values.find((value) => typeof value === "string" && value.length > 0);
 }
 
+/** 从 /v3/config 的 `agents[name=cli].models` 里取出当前 Key 被授权的模型。 */
 function modelsFromConfig(data) {
   const agents = Array.isArray(data?.agents) ? data.agents : data?.agent?.agents;
   const cli = Array.isArray(agents) ? agents.find((agent) => agent?.name === "cli") : undefined;
@@ -175,18 +201,18 @@ function modelsFromConfig(data) {
   });
 }
 
-function authenticationHeaders(credential) {
-  const value = assertUsableApiKey(credential.value, name, credential.ref ?? API_KEY_ENV);
-  return credential.kind === "bearer" ? { authorization: `Bearer ${value}` } : { "x-api-key": value };
+function authenticationHeaders(apiKey) {
+  const value = assertUsableApiKey(apiKey, name, API_KEY_ENV);
+  return { "x-api-key": value };
 }
 
-async function fetchWorkBuddyModels(credential, signal) {
+async function fetchWorkBuddyModels(apiKey, signal) {
   let response;
   try {
     response = await fetch(CONFIG_URL, {
       headers: {
         accept: "application/json",
-        ...authenticationHeaders(credential),
+        ...authenticationHeaders(apiKey),
         "user-agent": USER_AGENT,
         "x-product": "SaaS",
       },
@@ -205,11 +231,9 @@ async function fetchWorkBuddyModels(credential, signal) {
 }
 
 /**
- * WorkBuddy's credential is already resolved by the DSH adapter.  Do not
- * reuse pi-ai's DeepSeek envApiKeyAuth here: newer pi-ai releases require a
- * signal argument while older DSH adapters call auth resolvers without one.
- * This small adapter accepts both contracts and keeps bearer/API-key values
- * opaque to the provider implementation.
+ * WorkBuddy 的凭据由 DSH 适配器解析后传入。这里不复用 pi-ai 的
+ * envApiKeyAuth：新旧 DSH 版本对 auth resolver 的 signal 约定不同，
+ * 这个小适配器同时接受两种调用形式。
  */
 function workBuddyApiKeyAuth() {
   return {
@@ -244,13 +268,6 @@ function workBuddyProvider(models, provider = PROVIDER) {
   });
 }
 
-const GENERIC_APIS = Object.freeze({
-  "openai-completions": openAICompletionsApi,
-  "openai-responses": openAIResponsesApi,
-  "anthropic-messages": anthropicMessagesApi,
-});
-const GENERIC_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 function genericApiKeyAuth(provider) {
   return {
     name: `${provider} API Key`,
@@ -262,6 +279,7 @@ function genericApiKeyAuth(provider) {
   };
 }
 
+/** 把一个手写通用 provider 条目转成 pi-ai 模型对象。 */
 function genericModel(provider, source, entry) {
   const reasoningEfforts = entry.reasoningEfforts;
   const reasoning = reasoningEfforts !== false && reasoningEfforts && typeof reasoningEfforts === "object";
@@ -283,6 +301,7 @@ function genericModel(provider, source, entry) {
   };
 }
 
+/** 通用 provider 需要协议、地址和至少一个模型，缺一不可。 */
 function genericProvider(provider, source = {}) {
   const api = GENERIC_APIS[source.api];
   if (!api || !source.baseURL || !Array.isArray(source.models) || source.models.length === 0) return undefined;
@@ -297,25 +316,7 @@ function genericProvider(provider, source = {}) {
   });
 }
 
-function resolvedProfile(provider, source, piProvider, configuredMaxTokens = new Map(), requestContext) {
-  const apiKeyEnv = source.apiKeyEnv === undefined ? undefined : credentialRef(source.apiKeyEnv);
-  return {
-    ...source,
-    headers: runtimeHeaders(source.headers, requestContext),
-    provider,
-    displayName: source.displayName ?? piProvider.name ?? provider,
-    // dsh-llm-pi-ai reads this map for every exact model during catalog
-    // resolution. WorkBuddy profiles have no per-model validation failures
-    // here, but must still provide the empty map for the shared adapter API.
-    modelErrors: new Map(),
-    ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
-    streamIdleTimeoutMs: source.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
-    retryPolicy: resolveRetryPolicy(source.retryPolicy, `${name}: provider "${provider}" retryPolicy`),
-    configuredMaxTokens,
-    piProvider,
-  };
-}
-
+/** 内置目录路由：保留 pi-ai 自己的模型元数据，只套用用户改写过的字段。 */
 function selectBuiltinModels(base, entries) {
   if (!Array.isArray(entries) || entries.length === 0) return base;
   const byId = new Map(base.getModels().map((model) => [model.id, model]));
@@ -333,6 +334,28 @@ function selectBuiltinModels(base, entries) {
   return { ...base, getModels: () => selected };
 }
 
+/** 本插件是否负责这条路由：WorkBuddy、pi-ai 内置目录，或手写通用 provider。 */
+function ownsProvider(provider, builtins, source) {
+  return provider === PROVIDER || builtins.has(provider) || genericProvider(provider, source) !== undefined;
+}
+
+function resolvedProfile(provider, source, piProvider, configuredMaxTokens = new Map()) {
+  const apiKeyEnv = source.apiKeyEnv === undefined ? undefined : credentialRef(source.apiKeyEnv);
+  return {
+    ...source,
+    provider,
+    displayName: source.displayName ?? piProvider.name ?? provider,
+    // dsh-llm-pi-ai 在目录解析时读取这个 map；本插件没有逐模型校验失败，
+    // 但仍需提供空 map 以匹配共享适配器接口。
+    modelErrors: new Map(),
+    ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
+    streamIdleTimeoutMs: source.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS,
+    retryPolicy: resolveRetryPolicy(source.retryPolicy, `${name}: provider "${provider}" retryPolicy`),
+    configuredMaxTokens,
+    piProvider,
+  };
+}
+
 function selectWorkBuddyModels(base, entries) {
   if (!Array.isArray(entries) || entries.length === 0) return base;
   const byId = new Map(base.map((model) => [model.id, model]));
@@ -344,147 +367,10 @@ function selectWorkBuddyModels(base, entries) {
       name: entry.name ?? model?.name ?? entry.id,
       contextWindow: entry.contextWindow ?? model?.contextWindow ?? 262144,
       maxTokens: entry.maxTokens ?? model?.maxTokens ?? 32768,
-      images: entry.input?.includes("image") ?? model?.input.includes("image") ?? false,
+      images: entry.input?.includes("image") ?? model?.input?.includes("image") ?? false,
       ...reasoning,
     });
   });
-}
-
-function ownsProvider(provider, builtins, source) {
-  return WORKBUDDY_PROVIDERS.has(provider) || builtins.has(provider) || genericProvider(provider, source) !== undefined;
-}
-
-function runtimeHeaders(headers, requestContext) {
-  const base = { ...(headers ?? {}) };
-  if (!requestContext) return base;
-  return new Proxy(base, {
-    ownKeys(target) {
-      const extra = requestContext.getStore()?.headers ?? {};
-      return [...new Set([...Reflect.ownKeys(target), ...Reflect.ownKeys(extra)])];
-    },
-    getOwnPropertyDescriptor(target, property) {
-      const extra = requestContext.getStore()?.headers ?? {};
-      if (!Reflect.has(target, property) && !Reflect.has(extra, property)) return undefined;
-      return { configurable: true, enumerable: true, writable: true, value: this.get(target, property) };
-    },
-    get(target, property, receiver) {
-      const extra = requestContext.getStore()?.headers ?? {};
-      return Reflect.has(extra, property) ? extra[property] : Reflect.get(target, property, receiver);
-    },
-  });
-}
-
-function sessionBindingFor(routing, sessionId) {
-  if (!routing?.enabled) return undefined;
-  const id = typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
-  return id && Object.hasOwn(routing.bindings, id) ? routing.bindings[id] : undefined;
-}
-
-function normalizedProviderName(value) {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function isWorkBuddyProviderName(value) {
-  const normalized = normalizedProviderName(value);
-  return normalized.length > 0 && WORKBUDDY_PROVIDER_PATTERN.test(normalized);
-}
-
-function directWorkBuddyProvider(value) {
-  const normalized = normalizedProviderName(value);
-  if (normalized === PROVIDER || normalized === LEGACY_PROVIDER) return normalized;
-  return undefined;
-}
-
-function interruptedToolTailAssistantIndex(messages) {
-  let tailIndex = messages.length - 1;
-  while (tailIndex >= 0 && messages[tailIndex]?.role === "system") tailIndex -= 1;
-  if (tailIndex < 0) return -1;
-  const tail = messages[tailIndex];
-  if (tail?.role !== "user" || !Array.isArray(tail.content)) return -1;
-  if (!tail.content.some((block) => block?.type === "tool-result" && block.isError === true)) return -1;
-  for (let index = tailIndex - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.role !== "assistant") continue;
-    return Array.isArray(message.content) && message.content.some((block) => block?.type === "tool-call") ? index : -1;
-  }
-  return -1;
-}
-
-/**
- * Make WorkBuddy replay metadata safe across direct and wrapped provider ids.
- * The returned messages are request-only copies; durable session history is
- * never rewritten. An interrupted tool result deliberately loses only the
- * preceding assistant replayState so the model receives ordinary history.
- */
-function normalizeWorkBuddyReplay(options) {
-  if (!Array.isArray(options?.messages)) return options;
-  const currentProvider = options.provider;
-  if (!isWorkBuddyProviderName(currentProvider)) return options;
-  const interruptedIndex = interruptedToolTailAssistantIndex(options.messages);
-  let changed = false;
-  const messages = options.messages.map((message, index) => {
-    const source = message?.source;
-    const state = source?.replayState;
-    if (message?.role !== "assistant" || !source || state?.kind !== "pi-ai" || state?.version !== 1) return message;
-
-    let nextSource = source;
-    const sourceProvider = source.provider;
-    const replayProvider = state.provider;
-    if (isWorkBuddyProviderName(sourceProvider) && isWorkBuddyProviderName(replayProvider)) {
-      const canonical = directWorkBuddyProvider(replayProvider)
-        ?? directWorkBuddyProvider(sourceProvider)
-        ?? directWorkBuddyProvider(currentProvider);
-      if (canonical && (sourceProvider !== canonical || replayProvider !== canonical)) {
-        nextSource = {
-          ...nextSource,
-          provider: canonical,
-          replayState: { ...state, provider: canonical },
-        };
-      }
-    }
-
-    if (index === interruptedIndex && nextSource.replayState !== undefined) {
-      const { replayState: _ignored, ...withoutReplay } = nextSource;
-      nextSource = withoutReplay;
-    }
-    if (nextSource === source) return message;
-    changed = true;
-    return { ...message, source: nextSource };
-  });
-  return changed ? { ...options, messages } : options;
-}
-
-// The rc.6 pi-ai adapter rejects replay metadata it does not understand. A
-// newer DSH may persist a v2 envelope, so let old adapters use the durable
-// message content as provider-neutral history instead of failing the request.
-function stripUnsupportedReplay(options) {
-  if (!Array.isArray(options?.messages)) return options;
-  let changed = false;
-  const messages = options.messages.map((message) => {
-    const source = message?.source;
-    const state = source?.replayState;
-    if (state === undefined || (state?.kind === "pi-ai" && state?.version === 1)) return message;
-    changed = true;
-    const { replayState: _ignored, ...sourceWithoutReplay } = source;
-    return { ...message, source: sourceWithoutReplay };
-  });
-  return changed ? { ...options, messages } : options;
-}
-
-function prepareWorkBuddyOptions(options, legacyReplay = true) {
-  const normalized = normalizeWorkBuddyReplay(options);
-  return legacyReplay ? stripUnsupportedReplay(normalized) : normalized;
-}
-
-function workBuddySource(config, source) {
-  const providers = config?.providers ?? {};
-  return Object.hasOwn(providers, PROVIDER) || Object.hasOwn(providers, LEGACY_PROVIDER)
-    ? source
-    : { ...source, apiKeyEnv: source.apiKeyEnv ?? API_KEY_ENV };
 }
 
 function installSettingsCompat(ctx, ns, schema, entry, hooks) {
@@ -499,33 +385,36 @@ function installSettingsCompat(ctx, ns, schema, entry, hooks) {
   });
 }
 
-export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, workBuddySource, genericProvider, modelsFromConfig, ownsProvider, runtimeHeaders, stripUnsupportedReplay, normalizeWorkBuddyReplay, prepareWorkBuddyOptions, selectWorkBuddyModels, sessionBindingFor });
+export const __testing = Object.freeze({ authenticationHeaders, workBuddyApiKeyAuth, workBuddyRequestOptions, modelsFromConfig, selectWorkBuddyModels, selectBuiltinModels, genericProvider, genericModel, ownsProvider, resolvedProfile, settingsEntry, GENERIC_APIS, WORKBUDDY_DEFAULT_PROFILE });
 
 export function apply(ctx, config) {
-  installWorkBuddyWeb(ctx);
+  installWorkBuddyCredits(ctx);
   let current = () => config;
-  const requestContext = new AsyncLocalStorage();
   let remoteModels;
   let generation = 0;
   let memoRaw;
   let memoGeneration = -1;
   let memoized;
-  const loginSessionPromises = new Map();
   let remoteModelsKey;
+  let refreshPromise;
   const builtins = new Map(builtinProviders().map((provider) => [provider.id, provider]));
 
   const effectiveConfig = () => {
     const raw = current() ?? {};
     const providers = raw.providers ?? {};
-    const configured = providers[PROVIDER] ?? providers[LEGACY_PROVIDER];
     return {
       ...raw,
       providers: {
         ...providers,
-        [PROVIDER]: configured ?? { apiKeyEnv: API_KEY_ENV },
+        [PROVIDER]: providers[PROVIDER] ?? WORKBUDDY_DEFAULT_PROFILE,
       },
     };
   };
+
+  /** 逐模型显式配置的输出上限，交给适配器在调用方未指定时套用。 */
+  const configuredMaxTokensOf = (source) => new Map((source.models ?? []).flatMap((model) =>
+    Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? [[model.id, model.maxTokens]] : [],
+  ));
 
   const profiles = () => {
     const raw = effectiveConfig();
@@ -533,34 +422,26 @@ export function apply(ctx, config) {
     const result = new Map();
     for (const [provider, source] of Object.entries(raw.providers)) {
       if (!ownsProvider(provider, builtins, source)) continue;
-      if (WORKBUDDY_PROVIDERS.has(provider)) {
-        const sourceWithAuth = workBuddySource(current(), source);
+      const configured = configuredMaxTokensOf(source);
+      if (provider === PROVIDER) {
         const models = selectWorkBuddyModels(remoteModels ?? FALLBACK_MODELS, source.models);
-        const configured = new Map((source.models ?? []).flatMap((model) =>
-          Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? [[model.id, model.maxTokens]] : [],
-        ));
         result.set(provider, resolvedProfile(provider, {
-          ...sourceWithAuth,
-          headers: runtimeHeaders(sourceWithAuth.headers, requestContext),
+          ...WORKBUDDY_DEFAULT_PROFILE,
+          ...source,
           displayName: DISPLAY_NAME,
-        }, workBuddyProvider(models, provider), configured, requestContext));
+        }, workBuddyProvider(models, provider), configured));
         continue;
       }
       const base = builtins.get(provider);
-      if (!base) {
-        const generic = genericProvider(provider, source);
-        if (!generic) continue;
-        const configured = new Map((source.models ?? []).flatMap((model) =>
-          Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? [[model.id, model.maxTokens]] : [],
-        ));
-        result.set(provider, resolvedProfile(provider, source, generic, configured));
+      if (base) {
+        // pi-ai 内置路由：沿用内置模型元数据，只覆盖用户改写过的字段。
+        result.set(provider, resolvedProfile(provider, source, selectBuiltinModels(base, source.models), configured));
         continue;
       }
-      const selected = selectBuiltinModels(base, source.models);
-      const configured = new Map((source.models ?? []).flatMap((model) =>
-        Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? [[model.id, model.maxTokens]] : [],
-      ));
-      result.set(provider, resolvedProfile(provider, source, selected, configured));
+      // 手写通用路由：协议、地址与模型都来自 settings.yaml。
+      const generic = genericProvider(provider, source);
+      if (!generic) continue;
+      result.set(provider, resolvedProfile(provider, source, generic, configured));
     }
     memoRaw = current();
     memoGeneration = generation;
@@ -568,158 +449,22 @@ export function apply(ctx, config) {
     return result;
   };
 
-  const readSessionRouting = async () => {
-    const credentials = ctx.get("credentials");
-    const env = launchEnvironmentOf(ctx);
-    const ref = credentialRef(WORKBUDDY_SESSION_ROUTING_REF);
-    const stored = await credentials?.resolve(ref);
-    const value = stored?.value ?? env.get(ref)?.value;
-    return value ? parseWorkBuddySessionRouting(value) : createWorkBuddySessionRoutingState();
-  };
-  let routingBindingQueue = Promise.resolve();
-  const persistDefaultSessionBinding = (sessionId, fallbackBinding) => {
-    const task = routingBindingQueue.then(async () => {
-      const latest = await readSessionRouting();
-      const existing = sessionBindingFor(latest, sessionId);
-      if (existing) return existing;
-      const binding = latest.lastUsed ?? fallbackBinding;
-      if (!binding) return undefined;
-      const credentials = ctx.get("credentials");
-      if (!credentials) throw new Error("DSH 凭据服务不可用，无法保存会话认证");
-      await credentials.set(credentialRef(WORKBUDDY_SESSION_ROUTING_REF), serializeWorkBuddySessionRouting({
-        ...latest,
-        bindings: { ...latest.bindings, [sessionId]: binding },
-      }));
-      return binding;
-    });
-    routingBindingQueue = task.then(() => undefined, () => undefined);
-    return task;
-  };
-
-  const resolveLoginSession = async (requestedId) => {
-    const key = typeof requestedId === "string" && requestedId ? requestedId : "active";
-    let promise = loginSessionPromises.get(key);
-    if (!promise) {
-      promise = (async () => {
-        const credentials = ctx.get("credentials");
-        const env = launchEnvironmentOf(ctx);
-        const sessionsRef = credentialRef(WORKBUDDY_SESSIONS_REF);
-        const sessionRefs = [sessionsRef, credentialRef(LEGACY_SESSIONS_REF)];
-        let sessionsValue;
-        for (const ref of sessionRefs) {
-          const storedSessions = await credentials?.resolve(ref);
-          sessionsValue = storedSessions?.value ?? env.get(ref)?.value;
-          if (sessionsValue) break;
-        }
-        let store;
-        if (sessionsValue) {
-          store = parseWorkBuddySessions(sessionsValue);
-        } else {
-          const legacyRefs = [credentialRef(WORKBUDDY_SESSION_REF), credentialRef(LEGACY_SESSION_REF)];
-          let legacyValue;
-          for (const ref of legacyRefs) {
-            const storedLegacy = await credentials?.resolve(ref);
-            legacyValue = storedLegacy?.value ?? env.get(ref)?.value;
-            if (legacyValue) break;
-          }
-          if (!legacyValue) throw new Error("未找到 WorkBuddy 登录凭据");
-          store = createWorkBuddySessionStore([parseWorkBuddySession(legacyValue)]);
-        }
-        const active = typeof requestedId === "string" && requestedId
-          ? store.sessions.find((entry) => entry.id === requestedId)
-          : activeWorkBuddySession(store);
-        if (!active) throw new Error("未找到 WorkBuddy 登录账号");
-        let session = active;
-        if (sessionNeedsRefresh(session)) {
-          session = { ...session, ...(await refreshWorkBuddySession(session)), updatedAt: Date.now() };
-          const nextStore = {
-            ...store,
-            sessions: store.sessions.map((entry) => entry.id === session.id ? session : entry),
-          };
-          await credentials?.set(sessionsRef, serializeWorkBuddySessions(nextStore));
-          if (nextStore.activeId === session.id) await credentials?.set(credentialRef(WORKBUDDY_SESSION_REF), serializeWorkBuddySession(session));
-        }
-        return { ...session, sessionId: active.id, expiresAt: sessionCacheDeadline(session) };
-      })().finally(() => {
-        loginSessionPromises.delete(key);
-      });
-      loginSessionPromises.set(key, promise);
+  /**
+   * 解析某条路由的 API Key：DSH 凭据服务优先，其次启动环境。
+   * @param provider - 路由 id，仅用于错误信息。
+   * @param profile - 已解析的 profile，其 `apiKeyEnv` 指向凭据引用。
+   */
+  const resolveCredential = async (provider, profile) => {
+    const ref = profile?.apiKeyEnv;
+    if (ref === undefined) {
+      throw new LlmError(`${name}: Provider "${provider}" 未配置 API Key 引用，请在 WebUI 的模型设置中填写`, "MISSING_CREDENTIAL");
     }
-    return promise;
-  };
-
-  const resolveCredential = async (provider, profile, context = requestContext.getStore()) => {
-    context ??= {};
-    const ref = profile.apiKeyEnv;
-    const routing = WORKBUDDY_PROVIDERS.has(provider) ? await readSessionRouting() : createWorkBuddySessionRoutingState();
-    const sessionId = context?.sessionId ? String(context.sessionId) : undefined;
-    let binding = sessionBindingFor(routing, sessionId);
-    if (WORKBUDDY_PROVIDERS.has(provider) && routing.enabled && sessionId && !binding) {
-      let fallbackBinding;
-      if (!routing.lastUsed) {
-        if (ref) fallbackBinding = { mode: "api-key", apiKeyRef: ref };
-        else {
-          try {
-            const active = await resolveLoginSession();
-            fallbackBinding = { mode: "token", accountId: active.sessionId };
-          } catch (error) {
-            throw new LlmError(`${name}: 没有可用于当前会话的默认 WorkBuddy 凭证`, "MISSING_CREDENTIAL", { cause: error });
-          }
-        }
-      }
-      try {
-        binding = await persistDefaultSessionBinding(sessionId, fallbackBinding);
-      } catch (error) {
-        throw new LlmError(`${name}: 无法保存当前会话的 WorkBuddy 凭证绑定`, "MISSING_CREDENTIAL", { cause: error });
-      }
-      if (!binding) throw new LlmError(`${name}: 没有可用于当前会话的默认 WorkBuddy 凭证`, "MISSING_CREDENTIAL");
-    }
-    if (WORKBUDDY_PROVIDERS.has(provider) && binding?.mode === "token") {
-      let session;
-      try {
-        session = await resolveLoginSession(binding.accountId);
-      } catch (error) {
-        throw new LlmError(`${name}: 当前会话绑定的 WorkBuddy 登录账号不可用`, "MISSING_CREDENTIAL", { cause: error });
-      }
-      context.headers = {
-        ...(session.account.userId ? { "X-User-Id": session.account.userId } : {}),
-        ...(session.account.enterpriseId ? { "X-Enterprise-Id": session.account.enterpriseId, "X-Tenant-Id": session.account.enterpriseId } : {}),
-        ...(session.auth.domain ? { "X-Domain": session.auth.domain } : {}),
-      };
-      return { value: assertUsableApiKey(session.auth.accessToken, name, "WorkBuddy login session"), kind: "bearer", sessionId: session.sessionId };
-    }
-    if (WORKBUDDY_PROVIDERS.has(provider) && binding?.mode === "api-key") {
-      const bindingRef = binding.apiKeyRef;
-      if (!bindingRef) throw new LlmError(`${name}: 当前会话绑定的 API Key 引用无效`, "MISSING_CREDENTIAL");
-      const stored = await ctx.get("credentials")?.resolve(credentialRef(bindingRef));
-      const value = stored?.value ?? launchEnvironmentOf(ctx).get(credentialRef(bindingRef))?.value;
-      if (value) return { value: assertUsableApiKey(value, name, bindingRef), kind: "api-key", ref: bindingRef };
-      throw new LlmError(`${name}: 当前会话绑定的 API Key 不可用`, "MISSING_CREDENTIAL");
-    }
-    if (!ref && WORKBUDDY_PROVIDERS.has(provider)) {
-      let session;
-      try {
-        session = await resolveLoginSession();
-      } catch (error) {
-        throw new LlmError(`${name}: 未找到可用的 WorkBuddy 登录令牌，请运行 dsh-llm-workbuddy login`, "MISSING_CREDENTIAL", { cause: error });
-      }
-      context.headers = {
-        ...(session.account.userId ? { "X-User-Id": session.account.userId } : {}),
-        ...(session.account.enterpriseId ? { "X-Enterprise-Id": session.account.enterpriseId, "X-Tenant-Id": session.account.enterpriseId } : {}),
-        ...(session.auth.domain ? { "X-Domain": session.auth.domain } : {}),
-      };
-      return { value: assertUsableApiKey(session.auth.accessToken, name, "WorkBuddy login session"), kind: "bearer", sessionId: session.sessionId };
-    }
-    if (!ref) return { value: undefined, kind: "none" };
     const stored = await ctx.get("credentials")?.resolve(ref);
-    let value = stored?.value ?? launchEnvironmentOf(ctx).get(ref)?.value;
-    if (!value && ref === API_KEY_ENV) {
-      const legacyRef = credentialRef(LEGACY_API_KEY_ENV);
-      const legacyStored = await ctx.get("credentials")?.resolve(legacyRef);
-      value = legacyStored?.value ?? launchEnvironmentOf(ctx).get(legacyRef)?.value;
+    const value = stored?.value ?? launchEnvironmentOf(ctx).get(ref)?.value;
+    if (!value) {
+      throw new LlmError(`${name}: Provider "${provider}" 缺少 API Key，请在 WebUI 的模型设置中填写`, "MISSING_CREDENTIAL");
     }
-    if (value) return { value: assertUsableApiKey(value, name, ref), kind: "api-key", ref };
-    throw new LlmError(`${name}: Provider "${provider}" 缺少 API Key，请在 WebUI 的模型设置中填写`, "MISSING_CREDENTIAL");
+    return { value: assertUsableApiKey(value, name, ref), ref };
   };
 
   const resolveApiKey = async (provider, profile) => (await resolveCredential(provider, profile)).value;
@@ -729,66 +474,46 @@ export function apply(ctx, config) {
     resolveApiKey,
     resolveAttachments: () => ctx.get("attachments"),
   });
-  const sessionScopedStream = (stream, options) => {
-    const context = { sessionId: options?.sessionId === undefined ? undefined : String(options.sessionId), headers: {} };
-    const source = requestContext.run(context, () => stream(options));
-    const iterator = source[Symbol.asyncIterator]();
-    return {
-      [Symbol.asyncIterator]() { return this; },
-      next(value) { return requestContext.run(context, () => iterator.next(value)); },
-      return(value) { return requestContext.run(context, () => iterator.return?.(value) ?? Promise.resolve({ done: true, value })); },
-      throw(error) { return requestContext.run(context, () => iterator.throw?.(error) ?? Promise.reject(error)); },
-    };
-  };
   const adapterStream = adapter.stream.bind(adapter);
   const legacyAdapter = typeof adapter.prepareCall !== "function";
-  const invokeAdapterStream = (options) => adapterStream(prepareWorkBuddyOptions(options, legacyAdapter));
-  adapter.stream = (options) => sessionScopedStream(invokeAdapterStream, options);
-  // `prepareCall` was added after the DSH rc.6 adapter. Keep the direct
-  // `stream` path working on older hosts while wrapping prepared calls on
-  // newer hosts, whose runtime dispatches through the returned stream handle.
+  const invokeAdapterStream = (options) => adapterStream(options);
+  adapter.stream = invokeAdapterStream;
+  // `prepareCall` 在 DSH rc.6 之后才加入。旧宿主直接走 stream，新宿主走
+  // prepareCall 返回的 stream handle，两条路径都要保留。
   if (!legacyAdapter) {
     const adapterPrepareCall = adapter.prepareCall.bind(adapter);
     adapter.prepareCall = async (...args) => {
       const prepared = await adapterPrepareCall(...args);
-      return {
-        ...prepared,
-        stream: (options) => sessionScopedStream((preparedOptions) => prepared.stream(prepareWorkBuddyOptions(preparedOptions, false)), options),
-      };
+      return { ...prepared, stream: (options) => prepared.stream(options) };
     };
   } else {
-    // DSH 0.1.5 calls prepareCall unconditionally, while the rc.6 pi-ai
-    // adapter shipped without it. Keep that older adapter usable by exposing
-    // the same prepared-call shape from its existing methods.
     adapter.prepareCall = async (provider, model, signal) => ({
       model: await adapter.resolveModel(provider, model, signal),
-      stream: (options) => sessionScopedStream(invokeAdapterStream, options),
+      stream: (options) => invokeAdapterStream(options),
     });
   }
   const resolveModel = adapter.resolveModel.bind(adapter);
   adapter.resolveModel = async (provider, model, signal) => {
     const resolved = await resolveModel(provider, model, signal);
-    if (!WORKBUDDY_PROVIDERS.has(provider) || !resolved.reasoning) return resolved;
+    if (provider !== PROVIDER || !resolved.reasoning) return resolved;
     const configured = profiles().get(provider)?.piProvider.getModels().find((entry) => entry.id === model);
     const effort = configured?.defaultReasoningEffort;
     if (!effort || !resolved.reasoning.efforts.some((entry) => entry.id === effort)) return resolved;
     return { ...resolved, reasoning: { ...resolved.reasoning, defaultEffort: effort } };
   };
   const listModels = adapter.listModels.bind(adapter);
-  let refreshPromise;
   adapter.listModels = async (provider) => {
-    if (WORKBUDDY_PROVIDERS.has(provider)) {
+    if (provider === PROVIDER) {
       refreshPromise ??= (async () => {
         try {
           const profile = profiles().get(provider);
           const credential = await resolveCredential(provider, profile);
-          const cacheKey = credential.kind === "bearer" ? `token:${credential.sessionId ?? "active"}` : `api:${credential.ref ?? API_KEY_ENV}`;
-          if (remoteModels && remoteModelsKey === cacheKey) return;
-          remoteModels = await fetchWorkBuddyModels(credential);
-          remoteModelsKey = cacheKey;
+          if (remoteModels && remoteModelsKey === credential.ref) return;
+          remoteModels = await fetchWorkBuddyModels(credential.value);
+          remoteModelsKey = credential.ref;
           generation += 1;
         } catch {
-          // Keep the built-in catalog available while the key or network is absent.
+          // 没有 Key 或网络不可用时继续提供内置目录。
         }
       })().finally(() => {
         refreshPromise = undefined;
@@ -811,7 +536,8 @@ export function apply(ctx, config) {
     settingsPath: ["providers", provider.id],
     declared: false,
   }] : []), ...Object.entries(effectiveConfig().providers ?? {}).flatMap(([provider, source]) => {
-    if (WORKBUDDY_PROVIDERS.has(provider) || builtins.has(provider) || !genericProvider(provider, source)) return [];
+    // 手写通用路由才是 declared；内置目录路由由上一段提供更准确的显示名。
+    if (provider === PROVIDER || builtins.has(provider) || !genericProvider(provider, source)) return [];
     return [{
       provider,
       displayName: source.displayName ?? provider,
@@ -821,17 +547,16 @@ export function apply(ctx, config) {
     }];
   })];
 
-  let directory = ctx.llm.registerConfigurableProviders(directoryEntries());
-  let registration = ctx.llm.registerAdapter([...profiles().keys()], adapter);
+  const directory = ctx.llm.registerConfigurableProviders(directoryEntries());
+  const registration = ctx.llm.registerAdapter([...profiles().keys()], adapter);
 
   ctx.llm.registerModelDiscovery(NS, async (request) => {
-    if (WORKBUDDY_PROVIDERS.has(request.provider)) {
-      const profile = profiles().get(request.provider);
+    if (request.provider === PROVIDER) {
       const credential = request.apiKey
-        ? { value: request.apiKey, kind: "api-key", ref: API_KEY_ENV }
-        : await resolveCredential(request.provider, profile);
-      remoteModels = await fetchWorkBuddyModels(credential, request.signal);
-      remoteModelsKey = credential.kind === "bearer" ? `token:${credential.sessionId ?? "active"}` : `api:${credential.ref ?? API_KEY_ENV}`;
+        ? { value: request.apiKey, ref: API_KEY_ENV }
+        : await resolveCredential(PROVIDER, profiles().get(PROVIDER));
+      remoteModels = await fetchWorkBuddyModels(credential.value, request.signal);
+      remoteModelsKey = credential.ref;
       generation += 1;
       return remoteModels.map((model) => ({
         id: model.id,
@@ -840,9 +565,12 @@ export function apply(ctx, config) {
         maxTokens: model.maxTokens,
       }));
     }
-    const provider = builtins.get(request.provider);
-    if (!provider) throw new LlmError(`没有 Provider "${request.provider ?? ""}" 的模型目录`, "DISCOVERY_FAILED");
-    return provider.getModels().map((model) => ({
+    // 内置目录路由从 pi-ai 自己的注册表回答，不需要网络请求。
+    const builtin = request.provider === undefined ? undefined : builtins.get(request.provider);
+    if (!builtin) {
+      throw new LlmError(`没有 Provider "${request.provider ?? ""}" 的模型目录`, "DISCOVERY_FAILED");
+    }
+    return builtin.getModels().map((model) => ({
       id: model.id,
       name: model.name,
       contextWindow: model.contextWindow,
@@ -850,10 +578,9 @@ export function apply(ctx, config) {
     }));
   });
 
-  // Keep WorkBuddy out of the settings base layer so it appears in WebUI's
-  // "Add provider" dropdown. The runtime profile above still exists as the
-  // built-in implementation; selecting it only persists the credential ref.
-  installSettingsCompat(ctx, NS, Config, config ?? { providers: {} }, {
+  // WorkBuddy 作为 settings base 层出现，这样 WebUI 的“添加 Provider”下拉里
+  // 能看到它，且地址与协议已有默认值；运行时 profile 仍由上面的实现提供。
+  installSettingsCompat(ctx, NS, Config, settingsEntry(config), {
     setSource(source) {
       current = source;
     },

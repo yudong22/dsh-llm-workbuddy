@@ -2,437 +2,264 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { __testing } from "./index.js";
-import {
-  workBuddyApiKeyEntries,
-  activeWorkBuddySession,
-  workBuddySessionAccounts,
-  createWorkBuddyApiKeyStore,
-  createWorkBuddySessionStore,
-  createWorkBuddySessionRoutingState,
-  parseWorkBuddyApiKeys,
-  parseWorkBuddySession,
-  parseWorkBuddySessions,
-  refreshWorkBuddySession,
-  serializeWorkBuddyApiKeys,
-  serializeWorkBuddySession,
-  serializeWorkBuddySessions,
-  serializeWorkBuddySessionRouting,
-  parseWorkBuddySessionRouting,
-  sessionNeedsRefresh,
-  upsertWorkBuddyApiKey,
-  upsertWorkBuddySession,
-} from "./workbuddy-auth.js";
-import { authenticationMode } from "./workbuddy-web.js";
 import { __testing as creditsTesting, fetchWorkBuddyCredits } from "./workbuddy-credits.js";
 
-test("客户端兼容包装 Provider 并将 WorkBuddy 用量并入统计行", () => {
+test("插件只保留 API Key 认证，不再包含令牌登录入口", () => {
   const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
   const index = readFileSync(new URL("./index.js", import.meta.url), "utf8");
   const web = readFileSync(new URL("./workbuddy-web.js", import.meta.url), "utf8");
+  const cli = readFileSync(new URL("./cli.js", import.meta.url), "utf8");
+
+  // 胶囊与积分仍在，且注册在 composer dock 上。
+  assert.match(client, /workbuddy-credits/);
+  assert.match(client, /conversation\.composer\.dock/);
+  assert.match(client, /剩余积分/);
   assert.match(client, /WORKBUDDY_PROVIDER_PATTERN/);
-  assert.match(client, /isWorkBuddyProvider\(provider\)/);
-  assert.match(client, /isModLensWorkBuddyProvider/);
-  assert.match(client, /data-workbuddy-modlens-hint/);
-  assert.match(client, /出现 429 时请检查视觉引擎与额度/);
-  assert.match(client, /data-composer-stats/);
-  assert.match(client, /display: grid !important/);
-  assert.match(client, /会话级账号\/API Key/);
-  assert.match(client, /新会话默认凭证/);
-  assert.match(client, /data-workbuddy-new-session-selector/);
-  assert.match(client, /发送时自动绑定所选凭证/);
-  assert.match(client, /解除绑定/);
-  assert.match(client, /window\.confirm/);
-  assert.match(client, /sessionId/);
-  assert.match(client, /const hasTokenAccount = state\?\.mode === "token"/);
-  assert.match(client, /state\.routingEnabled && sessionId \? createElement/);
-  assert.match(client, /const seats = Array\.from\(document\.querySelectorAll\("\[data-composer-seat\]"\)\)/);
-  assert.match(client, /for \(const panel of panels\) panel\.remove\(\)/);
-  assert.match(index, /const legacyAdapter = typeof adapter\.prepareCall !== "function"/);
-  assert.match(index, /adapter\.prepareCall = async \(provider, model, signal\)/);
-  assert.match(index, /persistDefaultSessionBinding/);
-  assert.match(index, /bindings: \{ \.\.\.latest\.bindings, \[sessionId\]: binding \}/);
-  assert.match(web, /path: `\$\{ROUTE\}\/unbind`/);
-  assert.match(web, /const effectiveBinding = sessionBinding;/);
-  assert.match(web, /const displayedBinding = effectiveBinding \?\? suggestedBinding/);
+  assert.match(client, /display: flex !important/);
+  assert.match(client, /dsh-workbuddy-credits-pill/);
+  assert.match(client, /CREDIT_CACHE_TTL_MS = 30_000/);
+
+  // 令牌登录、会话级绑定与账号管理必须全部消失。
+  for (const removed of [
+    "令牌登录", "登录 WorkBuddy", "新会话默认凭证", "会话级账号", "解除绑定",
+    "WORKBUDDY_LOGIN_SESSION", "SESSION_ROUTING", "activeAccountId", "loginWorkBuddy",
+  ]) {
+    assert.doesNotMatch(client, new RegExp(removed), `client.js 仍包含 ${removed}`);
+  }
+  for (const removed of ["LEGACY_PROVIDER", "codebuddy-cn", "CODEBUDDY_API_KEY", "WORKBUDDY_SESSIONS_REF", "persistDefaultSessionBinding", "sessionScopedStream", "AsyncLocalStorage"]) {
+    assert.doesNotMatch(index, new RegExp(removed), `index.js 仍包含 ${removed}`);
+  }
+  for (const removed of ["/token", "/login", "/api-key", "/routing", "sessionId"]) {
+    assert.doesNotMatch(web, new RegExp(removed), `workbuddy-web.js 仍包含 ${removed}`);
+  }
+  assert.doesNotMatch(cli, /loginWorkBuddy|"login"/, "cli.js 仍包含令牌登录命令");
+
+  // 只注册一条本地路由。
+  assert.equal(web.match(/webServer\.register\(/g)?.length, 1);
 });
 
-test("旧版适配器对未知 replay 状态降级为普通历史", () => {
-  const legacy = {
-    kind: "pi-ai",
-    version: 1,
-    api: "openai-completions",
-    provider: "workbuddy-cn",
-    model: "model",
-    stopReason: "stop",
-    blocks: [],
-  };
-  const modern = { response: { kind: "pi-ai", version: 2 }, blocks: [] };
-  const options = {
-    messages: [
-      { source: { kind: "model", replayState: modern }, content: [] },
-      { source: { kind: "model", replayState: legacy }, content: [] },
-      { source: { kind: "model", replayState: { kind: "other", version: 1 } }, content: [] },
-    ],
-  };
-
-  const normalized = __testing.stripUnsupportedReplay(options);
-  assert.equal(normalized.messages[0].source.replayState, undefined);
-  assert.deepEqual(normalized.messages[1].source.replayState, legacy);
-  assert.equal(normalized.messages[2].source.replayState, undefined);
-  assert.notStrictEqual(normalized, options);
-  assert.ok(options.messages[0].source.replayState.response);
+test("API Key 以 x-api-key 头发送模型目录请求", () => {
+  assert.deepEqual(__testing.authenticationHeaders("ck_test_key"), { "x-api-key": "ck_test_key" });
+  assert.throws(() => __testing.authenticationHeaders(""), /API key/);
 });
 
-test("直接 Provider 和 ModLens 包装 Provider 都能归一化 WorkBuddy replay 身份", () => {
-  const replay = {
-    kind: "pi-ai",
-    version: 1,
-    api: "openai-completions",
-    provider: "workbuddy-cn",
-    model: "model",
-    stopReason: "stop",
-    blocks: [],
-  };
-  const wrapped = {
-    provider: "modlens-workbuddy-cn",
-    messages: [{
-      role: "assistant",
-      content: [],
-      source: { kind: "model", provider: "modlens-workbuddy-cn", replayState: replay },
-    }],
-  };
-  const normalized = __testing.normalizeWorkBuddyReplay(wrapped);
-  assert.notStrictEqual(normalized, wrapped);
-  assert.equal(normalized.messages[0].source.provider, "workbuddy-cn");
-  assert.equal(normalized.messages[0].source.replayState.provider, "workbuddy-cn");
-  assert.equal(wrapped.messages[0].source.provider, "modlens-workbuddy-cn");
-  assert.equal(wrapped.messages[0].source.replayState.provider, "workbuddy-cn");
-
-  const direct = {
-    provider: "workbuddy-cn",
-    messages: [{
-      role: "assistant",
-      content: [],
-      source: { kind: "model", provider: "workbuddy-cn", replayState: replay },
-    }],
-  };
-  assert.strictEqual(__testing.normalizeWorkBuddyReplay(direct), direct);
-});
-
-test("中断工具错误只移除最后一次助手消息的 replayState", () => {
-  const replay = {
-    kind: "pi-ai",
-    version: 1,
-    api: "openai-completions",
-    provider: "workbuddy-cn",
-    model: "model",
-    stopReason: "toolUse",
-    blocks: [{ type: "tool-call" }],
-  };
-  const options = {
-    provider: "workbuddy-cn",
-    messages: [
-      { role: "assistant", content: [{ type: "text", text: "earlier" }], source: { kind: "model", provider: "workbuddy-cn", replayState: { ...replay, blocks: [{ type: "text" }] } } },
-      { role: "assistant", content: [{ type: "tool-call", id: "call-1", name: "pwsh", arguments: "{}" }], source: { kind: "model", provider: "workbuddy-cn", replayState: replay } },
-      { role: "user", content: [{ type: "tool-result", toolCallId: "call-1", isError: true, content: [{ type: "text", text: "unknown outcome" }] }] },
-      { role: "system", content: [{ type: "text", text: "interrupted" }] },
-    ],
-  };
-  const normalized = __testing.prepareWorkBuddyOptions(options);
-  assert.equal(normalized.messages[0].source.replayState.kind, "pi-ai");
-  assert.equal(normalized.messages[1].source.replayState, undefined);
-  assert.equal(normalized.messages[2].content[0].isError, true);
-});
-
-test("非 WorkBuddy Provider 不会被 replay 兜底改写", () => {
-  const options = {
-    provider: "opencode-go-live",
-    messages: [{
-      role: "assistant",
-      content: [],
-      source: { kind: "model", provider: "opencode-go-live", replayState: { kind: "pi-ai", version: 1 } },
-    }],
-  };
-  assert.strictEqual(__testing.normalizeWorkBuddyReplay(options), options);
-});
-
-test("会话级认证状态只保存账号或 API Key 引用", () => {
-  const state = createWorkBuddySessionRoutingState(true, {
-    "session-a": { mode: "token", accountId: "user:user-a" },
-    "session-b": { mode: "api-key", apiKeyRef: "WORKBUDDY_API_KEY_DSH_B" },
-    ignored: { mode: "token", accountId: "" },
-    secret: { mode: "api-key", apiKey: "should-not-persist" },
-  }, { mode: "token", accountId: "user:user-a" });
-  const restored = parseWorkBuddySessionRouting(serializeWorkBuddySessionRouting(state));
-  assert.equal(restored.enabled, true);
-  assert.deepEqual(restored.lastUsed, { mode: "token", accountId: "user:user-a" });
-  assert.deepEqual(restored.bindings, {
-    "session-a": { mode: "token", accountId: "user:user-a" },
-    "session-b": { mode: "api-key", apiKeyRef: "WORKBUDDY_API_KEY_DSH_B" },
-  });
-  assert.equal(JSON.stringify(restored).includes("should-not-persist"), false);
-});
-
-test("直连与 ModLens 转发都保留明确会话绑定，默认值只供未绑定会话首次固化", () => {
-  const first = createWorkBuddySessionRoutingState(true, {
-    "session-a": { mode: "token", accountId: "user:user-a" },
-  }, { mode: "token", accountId: "user:user-b" });
-  const changedDefault = createWorkBuddySessionRoutingState(true, first.bindings, { mode: "token", accountId: "user:user-c" });
-  assert.deepEqual(__testing.sessionBindingFor(first, "session-a"), { mode: "token", accountId: "user:user-a" });
-  assert.deepEqual(__testing.sessionBindingFor(changedDefault, "session-a"), { mode: "token", accountId: "user:user-a" });
-  // ModLens 保留原始 options.sessionId 后再转发到 workbuddy-cn，因而与直连走同一绑定解析。
-  assert.deepEqual(__testing.sessionBindingFor(changedDefault, "session-a"), __testing.sessionBindingFor(first, "session-a"));
-  assert.equal(__testing.sessionBindingFor(changedDefault, "session-missing"), undefined);
-  assert.equal(__testing.sessionBindingFor(changedDefault, undefined), undefined);
-});
-
-test("忽略由其他插件负责的 Provider", () => {
-  const builtins = new Map([["deepseek", {}]]);
-
-  assert.equal(__testing.ownsProvider("workbuddy-cn", builtins), true);
-  assert.equal(__testing.ownsProvider("codebuddy-cn", builtins), true);
-  assert.equal(__testing.ownsProvider("deepseek", builtins), true);
-  assert.equal(__testing.ownsProvider("opencode-go-live", builtins), false);
-});
-
-test("完整的自定义 Provider 配置由插件注册为通用路由", () => {
-  const provider = __testing.genericProvider("txcodingplan", {
-    displayName: "Deepseek-v4-flash",
-    api: "openai-completions",
-    baseURL: "https://chatapi.weixin.qq.com/openai/v1",
-    models: [{ id: "Deepseek-v4-flash", name: "Deepseek-v4-flash", maxTokens: 48000 }],
-  });
-
-  assert.equal(provider.id, "txcodingplan");
-  assert.equal(provider.getModels()[0].provider, "txcodingplan");
-  assert.equal(provider.getModels()[0].api, "openai-completions");
-  assert.equal(__testing.ownsProvider("txcodingplan", new Map(), { api: "openai-completions", baseURL: "https://example.com", models: [{ id: "model" }] }), true);
-});
-
-test("API Key 和登录令牌使用各自的认证头", () => {
-  assert.deepEqual(__testing.authenticationHeaders({ value: "api-key", kind: "api-key" }), { "x-api-key": "api-key" });
-  assert.deepEqual(__testing.authenticationHeaders({ value: "login-token", kind: "bearer" }), { authorization: "Bearer login-token" });
+test("模型请求恢复 WorkBuddy 官方 User-Agent 与流空闲超时", () => {
+  const options = __testing.workBuddyRequestOptions({ headers: { "x-extra": "1" } });
+  assert.equal(options.headers["user-agent"], "CLI/unknown CodeBuddy/2.137.1");
+  assert.equal(options.headers["x-extra"], "1");
+  assert.equal(options.timeoutMs, 300_000);
 });
 
 test("WorkBuddy 自有认证助手兼容新旧 DSH 的 signal 调用约定", async () => {
   const auth = __testing.workBuddyApiKeyAuth();
-  const credential = { type: "api_key", key: "login-token" };
-
-  // Older DSH calls resolve without a signal. This must not dereference it.
-  assert.deepEqual(await auth.resolve({ credential }), {
-    auth: { apiKey: "login-token" },
-    source: "DSH credential",
-  });
-
-  // Newer DSH supplies an AbortSignal. The same resolver must remain valid.
-  const controller = new AbortController();
-  assert.deepEqual(await auth.resolve({ credential, signal: controller.signal }), {
-    auth: { apiKey: "login-token" },
-    source: "DSH credential",
-  });
-});
-
-test("登录请求头不修改 DSH 冻结的配置对象", () => {
-  const headers = __testing.runtimeHeaders(Object.freeze({ existing: "value" }));
-  headers["X-User-Id"] = "user";
-  assert.deepEqual(headers, { existing: "value", "X-User-Id": "user" });
-});
-
-test("模型请求恢复 WorkBuddy 官方 User-Agent", () => {
-  const options = Object.freeze({ headers: Object.freeze({ "user-agent": "deepseek-harness", existing: "value" }) });
-  const resolved = __testing.workBuddyRequestOptions(options);
-
-  assert.equal(resolved.headers["user-agent"], "CLI/unknown CodeBuddy/2.137.1");
-  assert.equal(resolved.headers.existing, "value");
-  assert.equal(resolved.timeoutMs, 300_000);
-  assert.equal(options.headers["user-agent"], "deepseek-harness");
-
-  assert.equal(__testing.workBuddyRequestOptions({ timeoutMs: 12_000 }).timeoutMs, 12_000);
-});
-
-test("显式空配置启用令牌模式，未配置时仍使用 API Key", () => {
-  assert.equal(__testing.workBuddySource({}, {}).apiKeyEnv, "WORKBUDDY_API_KEY");
-  assert.equal(__testing.workBuddySource({ providers: { "workbuddy-cn": {} } }, {}).apiKeyEnv, undefined);
-  assert.equal(__testing.workBuddySource({ providers: { "codebuddy-cn": {} } }, {}).apiKeyEnv, undefined);
-});
-
-test("WebUI 可以区分 API Key 与令牌认证模式", () => {
-  assert.equal(authenticationMode({ providers: {} }), "api-key");
-  assert.equal(authenticationMode({ providers: { "workbuddy-cn": { apiKeyEnv: "WORKBUDDY_API_KEY" } } }), "api-key");
-  assert.equal(authenticationMode({ providers: { "workbuddy-cn": {} } }), "token");
-  assert.equal(authenticationMode({ providers: { "codebuddy-cn": {} } }), "token");
-});
-
-test("登录会话可以安全序列化并按过期时间刷新", () => {
-  const session = {
-    auth: { accessToken: "access", refreshToken: "refresh", expiresAt: 2_000_000 },
-    account: { userId: "user", enterpriseId: "enterprise", ignored: "not-stored" },
-  };
-  const restored = parseWorkBuddySession(serializeWorkBuddySession(session));
-  assert.deepEqual(restored.account, { userId: "user", enterpriseId: "enterprise" });
-  assert.equal(sessionNeedsRefresh(restored, 1_000_000), false);
-  assert.equal(sessionNeedsRefresh(restored, 1_900_000), true);
-});
-
-test("多个登录账号可以持久化、去重并切换", () => {
-  const first = { auth: { accessToken: "access-1", refreshToken: "refresh-1" }, account: { userId: "user-1" } };
-  const second = { auth: { accessToken: "access-2", refreshToken: "refresh-2" }, account: { userId: "user-2" } };
-  const store = upsertWorkBuddySession(upsertWorkBuddySession(createWorkBuddySessionStore(), first), second);
-  const restored = parseWorkBuddySessions(serializeWorkBuddySessions({ ...store, activeId: store.sessions[0].id }));
-  assert.equal(restored.sessions.length, 2);
-  assert.equal(activeWorkBuddySession(restored).account.userId, "user-1");
-  assert.deepEqual(workBuddySessionAccounts(restored).map((entry) => entry.label), ["user-1", "user-2"]);
-  assert.equal(JSON.stringify(workBuddySessionAccounts(restored)).includes("refresh-1"), false);
-  const replaced = upsertWorkBuddySession(restored, { ...first, auth: { accessToken: "access-1-new", refreshToken: "refresh-1-new" } });
-  assert.equal(replaced.sessions.length, 2);
-  assert.equal(replaced.sessions.find((entry) => entry.id === "user:user-1").auth.accessToken, "access-1-new");
-});
-
-test("新增登录账号统一生成账号名称和 UID 展示字段", () => {
-  const session = {
-    auth: { accessToken: "access-new", refreshToken: "refresh-new" },
-    account: { account: { uid: "new-user-id", nickname: "新账号" } },
-  };
-  const store = upsertWorkBuddySession(createWorkBuddySessionStore(), session);
-  const [account] = workBuddySessionAccounts(store);
-
-  assert.equal(account.label, "新账号");
-  assert.equal(account.accountName, "新账号");
-  assert.equal(account.userId, "new-user-id");
-  assert.equal(account.account.displayName, "新账号");
-  assert.equal(account.account.userId, "new-user-id");
-});
-
-test("账号接口缺少名称时从 UIN 或登录令牌补齐展示信息", () => {
-  const payload = Buffer.from(JSON.stringify({ sub: "jwt-user-id", preferred_username: "jwt-account" })).toString("base64url");
-  const session = {
-    auth: { accessToken: `header.${payload}.signature`, refreshToken: "refresh-jwt" },
-    account: { uin: "uin-account" },
-  };
-  const store = upsertWorkBuddySession(createWorkBuddySessionStore(), session);
-  const [account] = workBuddySessionAccounts(store);
-
-  assert.equal(account.label, "uin-account");
-  assert.equal(account.userId, "jwt-user-id");
-  assert.equal(account.account.displayName, "uin-account");
-  assert.equal(account.account.uin, "uin-account");
-});
-
-test("API Key 目录只保存引用和展示元数据，不保存密钥值", () => {
-  const store = upsertWorkBuddyApiKey(createWorkBuddyApiKeyStore(), {
-    id: "dsh:WORKBUDDY_API_KEY_DSH_TEST",
-    ref: "WORKBUDDY_API_KEY_DSH_TEST",
-    label: "DSH API Key 1",
-  });
-  const restored = parseWorkBuddyApiKeys(serializeWorkBuddyApiKeys(store));
-  assert.deepEqual(workBuddyApiKeyEntries(restored).map((entry) => entry.ref), ["WORKBUDDY_API_KEY_DSH_TEST"]);
-  assert.equal(JSON.stringify(workBuddyApiKeyEntries(restored)).includes("secret"), false);
-  const noActive = createWorkBuddyApiKeyStore(restored.entries, null);
-  assert.equal(noActive.activeId, null);
-});
-
-test("插件直接调用官方刷新接口且不复用旧过期时间", async () => {
-  const originalFetch = globalThis.fetch;
-  let request;
-  globalThis.fetch = async (url, options) => {
-    request = { url, options };
-    return new Response(JSON.stringify({ code: 0, data: { accessToken: "new-access", expiresIn: 3600 } }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  };
-  try {
-    const refreshed = await refreshWorkBuddySession({
-      auth: { accessToken: "old-access", refreshToken: "refresh", expiresAt: 1 },
-      account: { uid: "user", enterpriseId: "enterprise" },
-    });
-    assert.equal(request.url, "https://copilot.tencent.com/v2/plugin/auth/token/refresh");
-    assert.equal(request.options.headers["X-Refresh-Token"], "refresh");
-    assert.equal(request.options.headers["X-Enterprise-Id"], "enterprise");
-    assert.equal(refreshed.auth.accessToken, "new-access");
-    assert.ok(refreshed.auth.expiresAt > Date.now() + 3_500_000);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.deepEqual(await auth.resolve({ credential: { key: "ck_direct" } }), { auth: { apiKey: "ck_direct" }, source: "DSH credential" });
+  // 无 credential 时返回 undefined，而不是抛错。
+  assert.equal(await auth.resolve({}), undefined);
+  // 旧宿主不传 signal，必须仍然可用。
+  assert.equal((await auth.resolve({ credential: { key: "ck_legacy" } })).auth.apiKey, "ck_legacy");
+  // 新宿主传入已取消的 signal 时立即中止。
+  const aborted = { throwIfAborted() { throw new Error("aborted"); } };
+  await assert.rejects(() => auth.resolve({ credential: { key: "ck" }, signal: aborted }), /aborted/);
+  await assert.rejects(() => auth.login({ signal: aborted }), /aborted/);
 });
 
 test("模型目录保留逐模型思考能力和默认档位", () => {
   const models = __testing.modelsFromConfig({
-    agents: [{ name: "cli", models: ["reasoning", "plain"] }],
+    agents: [{ name: "cli", models: ["glm-5.2", "hy3"] }],
     models: [
-      { id: "reasoning", name: "Reasoning", maxInputTokens: 1000, maxOutputTokens: 100, supportsReasoning: true, onlyReasoning: true, reasoning: { effort: "high" } },
-      { id: "plain", name: "Plain", maxInputTokens: 1000, maxOutputTokens: 100, supportsReasoning: false },
+      { id: "glm-5.2", name: "GLM-5.2", maxInputTokens: 1000000, maxOutputTokens: 48000, supportsReasoning: false },
+      { id: "hy3", name: "Hy3", maxInputTokens: 192000, maxOutputTokens: 64000, supportsReasoning: true, onlyReasoning: true, reasoning: { effort: "high" }, thinkingLevelMap: { high: "high" } },
     ],
   });
-
-  assert.deepEqual(models.map((model) => model.id), ["reasoning", "plain"]);
-  assert.equal(models[0].reasoning, true);
-  assert.equal(models[0].thinkingLevelMap.off, null);
-  assert.equal(models[0].thinkingLevelMap.xhigh, undefined);
-  assert.equal(models[0].defaultReasoningEffort, "high");
-  assert.equal(models[1].reasoning, false);
+  const byId = new Map(models.map((model) => [model.id, model]));
+  assert.equal(byId.get("glm-5.2").reasoning, false);
+  assert.equal(byId.get("glm-5.2").contextWindow, 1000000);
+  const hy3 = byId.get("hy3");
+  assert.equal(hy3.reasoning, true);
+  assert.equal(hy3.thinkingLevelMap.off, null);
+  assert.equal(hy3.thinkingLevelMap.high, "high");
+  assert.equal(hy3.defaultReasoningEffort, "high");
+  assert.deepEqual(hy3.input, ["text", "image"]);
 });
 
 test("自定义模型可覆盖自己的思考档位", () => {
-  const [model] = __testing.selectWorkBuddyModels([], [{
-    id: "custom",
-    contextWindow: 1000,
-    maxTokens: 100,
-    reasoningEfforts: { off: null, medium: "balanced" },
-  }]);
+  const models = __testing.selectWorkBuddyModels(
+    [{ id: "hy3", name: "Hy3", contextWindow: 192000, maxTokens: 64000, reasoning: true, thinkingLevelMap: { off: null, high: "high" } }],
+    [{ id: "hy3", reasoningEfforts: { high: "high", low: "low" } }],
+  );
+  assert.equal(models[0].reasoning, true);
+  assert.deepEqual(models[0].thinkingLevelMap, { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null });
+});
 
-  assert.equal(model.reasoning, true);
-  assert.equal(Object.hasOwn(model.thinkingLevelMap, "off"), false);
-  assert.equal(model.thinkingLevelMap.medium, "balanced");
-  assert.equal(model.thinkingLevelMap.high, null);
+test("未配置 apiKeyEnv 时给出 provider 默认引用与地址", () => {
+  const defaults = __testing.WORKBUDDY_DEFAULT_PROFILE;
+  assert.equal(defaults.baseURL, "https://copilot.tencent.com/v2");
+  assert.equal(defaults.api, "openai-completions");
+  assert.equal(defaults.apiKeyEnv, "WORKBUDDY_API_KEY");
+  assert.equal(defaults.displayName, "WorkBuddy 中国区");
+});
+
+test("组合条目缺省时 settings base 层仍带地址与协议默认值", () => {
+  // Cordis 在无显式配置时传入 {}，而不是 undefined；早期实现用 `??` 兜底，
+  // 导致 base 层为空、模型设置页的“提供方默认”不显示地址。这里锁住该行为。
+  for (const entry of [undefined, {}, { providers: {} }]) {
+    const profile = __testing.settingsEntry(entry).providers["workbuddy-cn"];
+    assert.equal(profile.baseURL, "https://copilot.tencent.com/v2", `entry=${JSON.stringify(entry)} 缺少 baseURL`);
+    assert.equal(profile.api, "openai-completions");
+    assert.equal(profile.apiKeyEnv, "WORKBUDDY_API_KEY");
+  }
+  // 用户已显式配置的字段优先于默认值。
+  const overridden = __testing.settingsEntry({
+    providers: { "workbuddy-cn": { baseURL: "https://proxy.example/v2", models: [{ id: "hy3" }] } },
+  }).providers["workbuddy-cn"];
+  assert.equal(overridden.baseURL, "https://proxy.example/v2");
+  assert.equal(overridden.api, "openai-completions");
+  assert.deepEqual(overridden.models, [{ id: "hy3" }]);
+});
+
+test("插件继续代理非 WorkBuddy 的 pi-ai 路由", () => {
+  // 插件在 cordis.patch.yml 里禁用了宿主 llm-pi-ai 行，因此它必须接管宿主
+  // 原有的全部职责。曾经只保留 workbuddy-cn，导致用户的其它 pi-ai provider
+  // （如 codex20x）随之失效。
+  const builtins = new Map([["openai", { id: "openai", name: "OpenAI" }]]);
+  // 1) WorkBuddy 自身
+  assert.equal(__testing.ownsProvider("workbuddy-cn", builtins, {}), true);
+  // 2) pi-ai 内置目录里的 provider
+  assert.equal(__testing.ownsProvider("openai", builtins, {}), true);
+  // 3) settings.yaml 里手写的通用 provider（协议 + 地址 + 模型齐备）
+  assert.equal(__testing.ownsProvider("codex20x", new Map(), {
+    api: "openai-responses", baseURL: "https://cpa.crzidea.com/v1", models: [{ id: "gpt-6-astra" }],
+  }), true);
+  // 4) 信息不全的手写条目不属于本插件
+  assert.equal(__testing.ownsProvider("incomplete", new Map(), { api: "openai-responses" }), false);
+  assert.equal(__testing.ownsProvider("unrelated", new Map(), {}), false);
+
+  // 三种协议都必须被识别，否则对应路由会静默消失。
+  assert.deepEqual(Object.keys(__testing.GENERIC_APIS).sort(), ["anthropic-messages", "openai-completions", "openai-responses"]);
+});
+
+test("通用 provider 生成可直接注册的 pi-ai provider", () => {
+  const provider = __testing.genericProvider("codex20x", {
+    api: "openai-responses",
+    baseURL: "https://cpa.crzidea.com/v1",
+    displayName: "Codex 20x",
+    models: [{ id: "gpt-6-astra", contextWindow: 1050000, maxTokens: 128000 }],
+  });
+  assert.equal(provider.id, "codex20x");
+  assert.equal(provider.name, "Codex 20x");
+  const models = provider.getModels();
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, "gpt-6-astra");
+  assert.equal(models[0].contextWindow, 1050000);
+  assert.equal(models[0].maxTokens, 128000);
+  // 缺地址或缺模型时不应生成 provider。
+  assert.equal(__testing.genericProvider("x", { api: "openai-responses", models: [{ id: "m" }] }), undefined);
+  assert.equal(__testing.genericProvider("y", { api: "openai-responses", baseURL: "https://e.com", models: [] }), undefined);
+});
+
+test("内置目录路由沿用 pi-ai 元数据并套用用户改写", () => {
+  const base = {
+    id: "openai",
+    getModels: () => [
+      { id: "gpt-5", name: "GPT-5", contextWindow: 400000, maxTokens: 128000 },
+      { id: "gpt-4o", name: "GPT-4o", contextWindow: 128000, maxTokens: 16000 },
+    ],
+  };
+  // 未配置时原样返回内置目录。
+  assert.equal(__testing.selectBuiltinModels(base, undefined), base);
+  const selected = __testing.selectBuiltinModels(base, [
+    { id: "gpt-5", name: "自定义名称", maxTokens: 64000 },
+    { id: "does-not-exist" },
+  ]);
+  const models = selected.getModels();
+  // 不存在的 id 被丢弃，内置的能力字段在未改写时保留。
+  assert.equal(models.length, 1);
+  assert.equal(models[0].name, "自定义名称");
+  assert.equal(models[0].maxTokens, 64000);
+  assert.equal(models[0].contextWindow, 400000);
+});
+
+test("积分汇总只累加剩余量，忽略已耗尽的资源包", () => {
+  const accounts = [
+    { CycleCapacityRemainPrecise: 30.1000003, CycleCapacitySizePrecise: 100, PackageName: "个人版" },
+    { CycleCapacityRemainPrecise: 100, CycleCapacitySizePrecise: 100, PackageName: "个人版" },
+    { CycleCapacityRemainPrecise: 0, CycleCapacitySizePrecise: 100, PackageName: "过期包" },
+  ];
+  const credits = accounts.reduce((sum, account) => sum + (creditsTesting.firstNumber(account, ["CycleCapacityRemainPrecise"]) ?? 0), 0);
+  assert.equal(Number(credits.toFixed(2)), 130.1);
+  // 同一到期时间/来源的条目合并为一条，已耗尽的资源包被丢弃。
+  const segments = creditsTesting.mergeSegments(creditsTesting.extractCreditSegments(accounts));
+  assert.equal(segments.length, 1);
+  assert.equal(segments.reduce((sum, segment) => sum + segment.remaining, 0), 130.1);
 });
 
 test("积分查询复用 WorkBuddy billing 接口并汇总有效资源", async () => {
-  const originalFetch = globalThis.fetch;
-  const requests = [];
-  globalThis.fetch = async (url, options) => {
-    requests.push({ url, options });
-    if (String(url).includes("get-user-resource")) {
-      return new Response(JSON.stringify({ code: 0, data: { Response: { Data: { Accounts: [
-        { CycleCapacityRemainPrecise: 12.5, CapacityRemainPrecise: 100, PackageName: "月度包" },
-        { CapacityRemain: 7 },
-      ] } } } }), { status: 200 });
-    }
-    return new Response(JSON.stringify({ code: 0, data: { total: 2, data: [
-      { requestId: "r1", requestTime: Date.now(), credit: 1.25 },
-      { requestId: "r2", requestTime: Date.now() - 1000, credit: 2.75 },
-    ] } }), { status: 200 });
-  };
-  try {
-    const result = await fetchWorkBuddyCredits({ auth: { accessToken: "token" }, account: { userId: "user" } });
-    assert.equal(result.credits, 19.5);
-    assert.equal(result.todayUsage.count, 2);
-    assert.equal(result.todayUsage.used, 4);
-    assert.equal(result.creditError, null);
-    assert.equal(requests[0].url, "https://www.codebuddy.cn/v2/billing/meter/get-user-resource");
-    assert.equal(requests[0].options.headers.authorization, "Bearer token");
-    assert.equal(requests[1].url, "https://www.codebuddy.cn/billing/meter/get-user-request-usage");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("企业积分响应支持不限量和周期重置时间", () => {
-  const result = creditsTesting.enterpriseUsage({ data: { limitNum: -1, cycleResetTime: "2026-09-01 00:00:00" } });
-  assert.equal(result.unlimited, true);
-  assert.equal(result.credits, null);
-  assert.ok(Number.isFinite(result.cycleResetTime));
-});
-
-test("积分查询只接受受信任的 WorkBuddy billing 域名", () => {
-  assert.equal(creditsTesting.normalizeHost("https://www.codebuddy.cn"), "https://www.codebuddy.cn");
-  assert.equal(creditsTesting.normalizeHost("https://evil.example"), "https://www.codebuddy.cn");
-  assert.deepEqual(creditsTesting.buildCreditResourceBody(new Date(2026, 7, 31, 9, 8, 7)), {
-    PageNumber: 1,
-    PageSize: 100,
-    ProductCode: "p_tcaca",
-    Status: [0, 3],
-    PackageEndTimeRangeBegin: "2026-08-31 09:08:07",
-    PackageEndTimeRangeEnd: "2127-08-31 09:08:07",
+  const calls = [];
+  const result = await fetchWorkBuddyCredits("ck_test", {
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            code: 0,
+            data: { Response: { Data: { TotalDosage: 5040, Accounts: [{ CycleCapacityRemainPrecise: 42.5, CycleCapacitySizePrecise: 100, PackageName: "个人版", ExpiredTime: "2026-09-25 09:04:43" }] } } },
+          });
+        },
+      };
+    },
   });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://www.codebuddy.cn/v2/billing/meter/get-user-resource");
+  assert.equal(calls[0].options.method, "POST");
+  // 与模型请求一致：Authorization 与 X-API-Key 同时发送。
+  assert.equal(calls[0].options.headers.authorization, "Bearer ck_test");
+  assert.equal(calls[0].options.headers["x-api-key"], "ck_test");
+  assert.equal(result.credits, 42.5);
+  assert.equal(result.totalDosage, 5040);
+  assert.equal(result.creditError, null);
+  assert.equal(result.segments.length, 1);
+  assert.equal(result.segments[0].source, "个人版");
+});
+
+test("积分接口失败时返回暂不可用而不是抛出", async () => {
+  const result = await fetchWorkBuddyCredits("ck_test", {
+    fetchImpl: async () => ({ ok: false, status: 401, async text() { return "unauthorized"; } }),
+  });
+  assert.equal(result.credits, null);
+  assert.deepEqual(result.segments, []);
+  assert.match(result.creditError, /401/);
+});
+
+test("积分查询只请求受信任的 WorkBuddy billing 域名", async () => {
+  const seen = [];
+  await fetchWorkBuddyCredits("ck_test", {
+    fetchImpl: async (url) => {
+      seen.push(String(url));
+      return { ok: true, status: 200, async text() { return JSON.stringify({ code: 0, data: { Response: { Data: { Accounts: [] } } } }); } };
+    },
+  });
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /^https:\/\/www\.codebuddy\.cn\//);
+});
+
+test("积分请求体覆盖全部有效状态并列出资源包", () => {
+  const body = creditsTesting.buildCreditResourceBody(new Date("2026-09-20T10:00:00"));
+  assert.equal(body.PageNumber, 1);
+  assert.equal(body.PageSize, 100);
+  assert.equal(body.ProductCode, "p_tcaca");
+  assert.deepEqual(body.Status, [0, 3]);
+  assert.match(body.PackageEndTimeRangeBegin, /^2026-09-20 /);
+});
+
+test("客户端不再为 API Key 模式渲染额外面板", () => {
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  // 认证面板依赖的 DOM 注入与输入框改写必须消失。
+  assert.doesNotMatch(client, /MutationObserver/);
+  assert.doesNotMatch(client, /aria-label="API 密钥"/);
+  assert.doesNotMatch(client, /data-workbuddy-auth-switch/);
+  assert.doesNotMatch(client, /document\.createElement\("input"\)/);
+  // 只保留一个 slot 注册。
+  assert.equal(client.match(/ctx\.slots\.register\(/g)?.length, 1);
 });
