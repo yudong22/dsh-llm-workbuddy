@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * 安装/卸载 @axiaohungry/dsh-llm-workbuddy 到 DSH 的 web 与 headless Profile。
+ * 安装/卸载 @yudong22/dsh-llm-workbuddy 到 DSH 的 web 与 headless Profile。
  *
  * 令牌登录已随插件精简一并移除，因此不再提供 `login` 子命令；认证统一在
  * WebUI 的模型设置里填入 WorkBuddy API Key。
@@ -14,7 +14,13 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parseDocument } from "yaml";
 
-const PACKAGE = "@axiaohungry/dsh-llm-workbuddy";
+const PACKAGE = "@yudong22/dsh-llm-workbuddy";
+/**
+ * 本包是 @axiaohungry/dsh-llm-workbuddy 的 fork。两包插入同一行
+ * （`id: llm-workbuddy`）且都声明 `workbuddy-cn`，同时安装会冲突，
+ * 因此安装时先移除旧 scope 的包。
+ */
+const LEGACY_PACKAGES = ["@axiaohungry/dsh-llm-workbuddy"];
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
 const PACKAGE_SPEC = `${PACKAGE}@${PACKAGE_VERSION}`;
 const PROVIDER_PATH = ["llm-pi-ai", "providers", "workbuddy-cn"];
@@ -124,6 +130,12 @@ function install() {
     runDsh(["plugin", "--profile", profile, "list", "--depth", "0"]);
     const workspace = join(dshHome(), "profiles", profile, "pnpm-workspace.yaml");
     withPnpmBuildPolicy(workspace, () => {
+      // 先从旧 scope 迁移：两个包会争夺同一个 `llm-workbuddy` 组合行。
+      for (const legacy of LEGACY_PACKAGES) {
+        if (profileHasPackage(dshHome(), profile, legacy)) {
+          runDsh(["plugin", "--profile", profile, "remove", legacy]);
+        }
+      }
       runDsh(["plugin", "--profile", profile, "add", PACKAGE_SPEC]);
     });
   }
@@ -134,9 +146,12 @@ function uninstall(home = dshHome()) {
   const backup = cleanSettings(join(home, "settings.yaml"));
   for (const profile of ["web", "headless"]) {
     const workspace = join(home, "profiles", profile, "pnpm-workspace.yaml");
-    if (profileHasPackage(home, profile, PACKAGE)) {
+    const installed = [PACKAGE, ...LEGACY_PACKAGES].filter((packageName) => profileHasPackage(home, profile, packageName));
+    if (installed.length) {
       withPnpmBuildPolicy(workspace, () => {
-        runDsh(["plugin", "--profile", profile, "remove", PACKAGE]);
+        for (const packageName of installed) {
+          runDsh(["plugin", "--profile", profile, "remove", packageName]);
+        }
       });
     }
     cleanPnpmWorkspace(workspace);

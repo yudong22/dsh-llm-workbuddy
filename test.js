@@ -263,3 +263,30 @@ test("客户端不再为 API Key 模式渲染额外面板", () => {
   // 只保留一个 slot 注册。
   assert.equal(client.match(/ctx\.slots\.register\(/g)?.length, 1);
 });
+
+test("包名、客户端模块 id 与组合行保持一致", () => {
+  // DSH 通过 package.json 的 dsh.client / exports["./client"] 发现浏览器半边，
+  // 其中 __ModuleLoader__.load({ id }) 必须等于包名（与官方客户端包一致）。
+  // 改名时若漏掉任一处，客户端半边会静默不加载。
+  const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+  const client = readFileSync(new URL("./client.js", import.meta.url), "utf8");
+  const patch = readFileSync(new URL("./cordis.patch.yml", import.meta.url), "utf8");
+  const cli = readFileSync(new URL("./cli.js", import.meta.url), "utf8");
+
+  assert.equal(pkg.name, "@yudong22/dsh-llm-workbuddy");
+  assert.match(client, new RegExp(`id: "${pkg.name.replace("/", "\\/")}"`));
+  assert.match(patch, new RegExp(`name: '${pkg.name.replace("/", "\\/")}'`));
+  assert.match(cli, new RegExp(`const PACKAGE = "${pkg.name.replace("/", "\\/")}"`));
+  assert.match(client, new RegExp(`style\\.dataset\\.plugin = "${pkg.name.replace("/", "\\/")}"`));
+
+  // 仓库元数据必须指向本 fork，而不是上游。
+  assert.match(pkg.repository.url, /yudong22\/dsh-llm-workbuddy/);
+  assert.doesNotMatch(pkg.repository.url, /Axiaohungry/);
+
+  // 旧 scope 只应作为安装时的迁移目标出现（常量 + 说明注释）。
+  assert.deepEqual(cli.match(/@axiaohungry\/dsh-llm-workbuddy/g), [
+    "@axiaohungry/dsh-llm-workbuddy",
+    "@axiaohungry/dsh-llm-workbuddy",
+  ]);
+  assert.match(cli, /const LEGACY_PACKAGES = \["@axiaohungry\/dsh-llm-workbuddy"\]/);
+});

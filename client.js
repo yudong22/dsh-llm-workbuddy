@@ -6,7 +6,7 @@
  * 这里不再注入任何表单、不再监听 DOM 变化、也不再处理登录令牌。
  */
 window.__ModuleLoader__.load({
-  id: "@axiaohungry/dsh-llm-workbuddy",
+  id: "@yudong22/dsh-llm-workbuddy",
   factory: (require) => {
     const ROUTE = "/dsh-llm-workbuddy/credits";
     const WORKBUDDY_PROVIDER_PATTERN = /(?:^|-)(?:work-?buddy|code-?buddy)(?:-|$)/;
@@ -382,7 +382,8 @@ window.__ModuleLoader__.load({
     function installComposerDockLayout() {
       if (typeof document === "undefined" || document.querySelector('style[data-plugin-css="dsh-llm-workbuddy-composer-dock"]')) return;
       const style = document.createElement("style");
-      style.dataset.plugin = "@axiaohungry/dsh-llm-workbuddy";
+      style.dataset.plugin = "@yudong22/dsh-llm-workbuddy";
+      // 这个去重标记保持稳定：迁移期间新旧包同时存在时，避免样式被注入两次。
       style.dataset.pluginCss = "dsh-llm-workbuddy-composer-dock";
       style.textContent = `
 [data-slot="conversation.composer.dock"]:has(> [data-composer-stats]),

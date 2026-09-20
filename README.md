@@ -7,6 +7,12 @@
 > API Key 来自 **WorkBuddy**，用于调用供 WorkBuddy 使用的模型服务。本插件是第三方
 > 适配器，不属于 WorkBuddy、CodeBuddy 或 DSH 官方项目。
 
+> [!NOTE]
+> 本包是 [`@axiaohungry/dsh-llm-workbuddy`](https://github.com/Axiaohungry/dsh-llm-workbuddy)
+> 的 fork，改为仅支持 API Key 认证。原作者为 Axiaohungry，原项目以 MIT 许可发布，
+> 版权归其所有。两个包会插入同一个 `llm-workbuddy` 组合行，**不要同时安装**；
+> `install` 命令在检测到旧包时会先将其移除。
+
 ## 功能
 
 - 在 DSH WebUI 中使用 `WorkBuddy 中国区`；
@@ -41,7 +47,7 @@ WorkBuddy 外，它也会继续代理 `settings.yaml` 中其它 pi-ai provider
 在 PowerShell 或终端执行：
 
 ```powershell
-npx --yes @axiaohungry/dsh-llm-workbuddy@latest install
+npx --yes @yudong22/dsh-llm-workbuddy@latest install
 ```
 
 安装器会为 DSH 的 `web` 和 `headless` Profile 安装插件。安装完成后重启 DSH。
@@ -49,7 +55,7 @@ npx --yes @axiaohungry/dsh-llm-workbuddy@latest install
 也可以只安装 Web Profile：
 
 ```powershell
-dsh plugin --profile web add @axiaohungry/dsh-llm-workbuddy@latest
+dsh plugin --profile web add @yudong22/dsh-llm-workbuddy@latest
 ```
 
 ## WebUI 配置
@@ -142,13 +148,13 @@ off / minimal / low / medium / high / xhigh / max
 重新执行安装命令即可更新，已有的模型配置与 API Key 会保留：
 
 ```powershell
-npx --yes @axiaohungry/dsh-llm-workbuddy@latest install
+npx --yes @yudong22/dsh-llm-workbuddy@latest install
 ```
 
 ## 卸载
 
 ```powershell
-npx --yes @axiaohungry/dsh-llm-workbuddy@latest uninstall
+npx --yes @yudong22/dsh-llm-workbuddy@latest uninstall
 ```
 
 卸载会移除 `WorkBuddy 中国区` 的 Provider 和插件包，并备份 DSH 设置文件。API Key

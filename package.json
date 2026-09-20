@@ -1,8 +1,11 @@
 {
-  "name": "@axiaohungry/dsh-llm-workbuddy",
+  "name": "@yudong22/dsh-llm-workbuddy",
   "version": "1.3.20",
   "description": "通过 WorkBuddy API Key 为 DeepSeek Harness 接入 WorkBuddy 模型",
-  "author": "Axiaohungry",
+  "author": "yudong22",
+  "contributors": [
+    "Axiaohungry (upstream author of @axiaohungry/dsh-llm-workbuddy)"
+  ],
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -22,11 +25,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Axiaohungry/dsh-llm-workbuddy.git"
+    "url": "git+https://github.com/yudong22/dsh-llm-workbuddy.git"
   },
-  "homepage": "https://github.com/Axiaohungry/dsh-llm-workbuddy#readme",
+  "homepage": "https://github.com/yudong22/dsh-llm-workbuddy#readme",
   "bugs": {
-    "url": "https://github.com/Axiaohungry/dsh-llm-workbuddy/issues"
+    "url": "https://github.com/yudong22/dsh-llm-workbuddy/issues"
   },
   "files": [
     "index.js",
